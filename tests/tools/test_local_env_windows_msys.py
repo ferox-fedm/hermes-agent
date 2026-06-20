@@ -26,6 +26,7 @@ from tools.environments.local import (
     LocalEnvironment,
     _msys_to_windows_path,
     _resolve_safe_cwd,
+    _windows_to_msys_path,
 )
 
 
@@ -71,6 +72,53 @@ class TestMsysToWindowsPath:
 
 
 # ---------------------------------------------------------------------------
+# _windows_to_msys_path — pure-function unit tests
+# ---------------------------------------------------------------------------
+
+class TestWindowsToMsysPath:
+    def test_translates_drive_path(self, monkeypatch):
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        assert _windows_to_msys_path(r"C:\Users\x") == "/c/Users/x"
+        assert _windows_to_msys_path(r"D:\Projects\foo bar") == "/d/Projects/foo bar"
+
+    def test_translates_bare_drive_root(self, monkeypatch):
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        assert _windows_to_msys_path(r"C:\") == "/c"
+        assert _windows_to_msys_path(r"C:") == "/c"
+
+    def test_translates_unc_path(self, monkeypatch):
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        assert _windows_to_msys_path(r"\\server\share\folder") == "//server/share/folder"
+        assert _windows_to_msys_path(r"\\server\share") == "//server/share"
+
+    def test_idempotent_on_posix(self, monkeypatch):
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        assert _windows_to_msys_path("/c/Users/x") == "/c/Users/x"
+        assert _windows_to_msys_path("/d/Projects") == "/d/Projects"
+
+    def test_noop_on_non_windows(self, monkeypatch):
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", False)
+        assert _windows_to_msys_path(r"C:\Users\x") == r"C:\Users\x"
+
+    def test_empty_string(self, monkeypatch):
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        assert _windows_to_msys_path("") == ""
+
+    def test_local_env_init_converts_cwd_to_posix(self, monkeypatch, tmp_path):
+        """LocalEnvironment must store cwd in POSIX format on Windows."""
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        native = str(tmp_path)
+        fake_posix = "/c/fake/path"
+        with patch.object(
+            LocalEnvironment, "init_session", autospec=True, return_value=None
+        ), patch.object(
+            local_mod, "_windows_to_msys_path", return_value=fake_posix
+        ):
+            env = LocalEnvironment(cwd=native, timeout=10)
+        assert env.cwd == fake_posix
+
+
+# ---------------------------------------------------------------------------
 # _resolve_safe_cwd — Windows fast path
 # ---------------------------------------------------------------------------
 
@@ -105,9 +153,8 @@ class TestUpdateCwdWindowsMsys:
         self, monkeypatch, tmp_path,
     ):
         """When Git Bash writes ``/c/Users/x`` to the cwd marker file on
-        Windows, ``_update_cwd`` must translate to native form before
-        validating and storing — otherwise ``os.path.isdir`` rejects a
-        perfectly real directory."""
+        Windows, ``_update_cwd`` must validate via Windows form then store
+        POSIX form — so bash commands keep working."""
         original = tmp_path / "starting"
         original.mkdir()
 
@@ -126,16 +173,23 @@ class TestUpdateCwdWindowsMsys:
         with open(env._cwd_file, "w") as f:
             f.write("/c/whatever/from/bash")
 
-        # Translate the synthetic MSYS string to the real native dir.
+        # Translate the synthetic MSYS string to the real native dir for validation,
+        # then back to POSIX for storage.
         def fake_translate(p):
             if p == "/c/whatever/from/bash":
                 return str(new_dir)
             return p
 
-        with patch.object(local_mod, "_msys_to_windows_path", side_effect=fake_translate):
+        def fake_to_posix(p):
+            if p == str(new_dir):
+                return "/c/whatever/from/bash"
+            return p
+
+        with patch.object(local_mod, "_msys_to_windows_path", side_effect=fake_translate), \
+             patch.object(local_mod, "_windows_to_msys_path", side_effect=fake_to_posix):
             env._update_cwd({"output": "", "returncode": 0})
 
-        assert env.cwd == str(new_dir)
+        assert env.cwd == "/c/whatever/from/bash"
 
 
 # ---------------------------------------------------------------------------
@@ -171,9 +225,9 @@ class TestExtractCwdFromOutputWindowsMsys:
         ):
             env._extract_cwd_from_output(result)
 
-        assert env.cwd == str(original)
+        assert env.cwd == _windows_to_msys_path(str(original))
 
-    def test_valid_msys_marker_normalized_to_native(self, monkeypatch, tmp_path):
+    def test_valid_msys_marker_normalized_to_posix(self, monkeypatch, tmp_path):
         original = tmp_path / "starting"
         original.mkdir()
         new_dir = tmp_path / "next"
@@ -192,7 +246,8 @@ class TestExtractCwdFromOutputWindowsMsys:
             "returncode": 0,
         }
 
-        with patch.object(local_mod, "_msys_to_windows_path", return_value=str(new_dir)):
+        with patch.object(local_mod, "_msys_to_windows_path", return_value=str(new_dir)), \
+             patch.object(local_mod, "_windows_to_msys_path", return_value="/c/whatever"):
             env._extract_cwd_from_output(result)
 
-        assert env.cwd == str(new_dir)
+        assert env.cwd == "/c/whatever"

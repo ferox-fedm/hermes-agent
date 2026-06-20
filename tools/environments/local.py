@@ -39,6 +39,30 @@ def _msys_to_windows_path(cwd: str) -> str:
     return f"{drive}:{tail or chr(92)}"  # chr(92) = backslash, avoid raw-string escape
 
 
+def _windows_to_msys_path(path: str) -> str:
+    """Convert a native Windows path to Git Bash / MSYS POSIX format.
+
+    ``C:\\Users\\x`` → ``/c/Users/x``, ``C:\\`` → ``/c/``.
+    UNC paths: ``\\\\server\\share`` → ``//server/share``.
+    No-ops on non-Windows, for empty strings, or when the path is
+    already in POSIX form.
+    """
+    if not _IS_WINDOWS or not path:
+        return path
+    # UNC paths: \\server\share\... → //server/share/...
+    if path.startswith("\\\\"):
+        return path.replace("\\", "/")
+    # Already POSIX?  (starts with / and second segment is ≤1 char before /)
+    if path.startswith("/") and not re.match(r'^/[a-zA-Z][\\/]', path):
+        return path
+    m = re.match(r'^([a-zA-Z]):[\\/](.*)?$', path)
+    if not m:
+        return path
+    drive = m.group(1).lower()
+    tail = (m.group(2) or "").replace('\\', '/')
+    return f"/{drive}/{tail}".rstrip('/') or f"/{drive}"
+
+
 def _resolve_safe_cwd(cwd: str) -> str:
     """Return ``cwd`` if it exists as a directory, else the nearest existing
     ancestor.  Falls back to ``tempfile.gettempdir()`` only if walking up the
@@ -269,12 +293,21 @@ def _find_bash() -> str:
 
     found = shutil.which("bash")
     if found:
-        return found
+        # WSL's bash (C:\Windows\system32\bash.EXE) cannot handle Windows
+        # paths or MSYS POSIX paths — it is a completely different environment.
+        # Skip it so we fall through to the Git Bash candidates below.
+        if not found.lower().endswith(r"\system32\bash.exe"):
+            return found
 
     for candidate in (
         os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Git", "bin", "bash.exe"),
         os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "Git", "bin", "bash.exe"),
         os.path.join(_local_appdata, "Programs", "Git", "bin", "bash.exe"),
+        # Scoop-installed Git
+        os.path.join(os.environ.get("SCOOP", r"C:\Users\{}\scoop".format(
+            os.environ.get("USERNAME", ""))), "apps", "git", "current", "bin", "bash.exe"),
+        # winget / Chocolatey Git
+        os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Git", "usr", "bin", "bash.exe"),
     ):
         if candidate and os.path.isfile(candidate):
             return candidate
@@ -496,7 +529,26 @@ class LocalEnvironment(BaseEnvironment):
         if cwd:
             cwd = os.path.expanduser(cwd)
         super().__init__(cwd=cwd or os.getcwd(), timeout=timeout, env=env)
+        # CRITICAL: Store as POSIX for bash compatibility on Windows.
+        if _IS_WINDOWS and self.cwd:
+            self.cwd = _windows_to_msys_path(self.cwd)
         self.init_session()
+
+    def _wrap_command(self, command: str, cwd: str) -> str:
+        """Override to convert POSIX cwd back to Windows for bash ``cd``.
+
+        ``self.cwd`` is stored in POSIX format for bash ``pwd`` compatibility,
+        but ``builtin cd`` does NOT do MSYS path translation on quoted strings,
+        so ``cd '/c/Users/x'`` fails.  We convert back to Windows form
+        (``C:/Users/x``) for the ``cd`` command only, using forward slashes
+        so ``shlex.quote`` doesn't trip on backslashes.
+        """
+        if _IS_WINDOWS:
+            win = _msys_to_windows_path(cwd)
+            cd_cwd = win.replace("\\", "/")
+        else:
+            cd_cwd = cwd
+        return super()._wrap_command(command, cd_cwd)
 
     def get_temp_dir(self) -> str:
         """Return a shell-safe writable temp dir for local execution.
@@ -573,22 +625,22 @@ class LocalEnvironment(BaseEnvironment):
         # POSIX paths (``/c/Users/...``) to native form so a perfectly valid
         # ``pwd -P`` result from bash isn't mistakenly treated as "missing"
         # and spammed as a warning on every command.
-        safe_cwd = _resolve_safe_cwd(self.cwd)
-        if safe_cwd != self.cwd:
-            # MSYS → Windows translation alone shouldn't surface as a warning
-            # (it's a benign normalization, not a recovery). Only warn when
-            # the directory really doesn't exist on disk.
-            normalized = _msys_to_windows_path(self.cwd) if _IS_WINDOWS else self.cwd
-            if safe_cwd != normalized:
-                logger.warning(
-                    "LocalEnvironment cwd %r is missing on disk; "
-                    "falling back to %r so terminal commands keep working.",
-                    self.cwd,
-                    safe_cwd,
-                )
-            self.cwd = safe_cwd
+        safe_cwd_win = _resolve_safe_cwd(self.cwd)
+        normalized = _msys_to_windows_path(self.cwd) if _IS_WINDOWS else self.cwd
+        if safe_cwd_win != normalized:
+            logger.warning(
+                "LocalEnvironment cwd %r is missing on disk; "
+                "falling back to %r so terminal commands keep working.",
+                self.cwd,
+                safe_cwd_win,
+            )
+        # CRITICAL: self.cwd stays POSIX for bash; _popen_cwd is Windows for Popen.
+        if _IS_WINDOWS:
+            self.cwd = _windows_to_msys_path(safe_cwd_win)
+        else:
+            self.cwd = safe_cwd_win
 
-        _popen_cwd = self.cwd
+        _popen_cwd = safe_cwd_win if _IS_WINDOWS else self.cwd
 
         _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
 
@@ -689,25 +741,21 @@ class LocalEnvironment(BaseEnvironment):
     def _update_cwd(self, result: dict):
         """Read CWD from temp file (local-only, no round-trip needed).
 
-        Skip the assignment when the path no longer exists as a directory —
-        ``pwd -P`` on a deleted cwd can leave a stale value in the marker
-        file, and propagating it would re-wedge the next ``Popen``.  The
-        ``_run_bash`` recovery path will resolve a safe fallback if needed.
-
         On Windows, the value written by Git Bash's ``pwd -P`` is in
-        MSYS form (``/c/Users/x``). Translate it to native Windows form
-        before validating with ``os.path.isdir`` and before storing on
-        ``self.cwd``; otherwise the isdir check rejects every valid
-        result and ``_run_bash`` later prints a misleading "cwd is
-        missing" warning on every command.
+        MSYS form (``/c/Users/x``).  We convert to native Windows form
+        for the ``os.path.isdir`` validation, then convert back to POSIX
+        before storing on ``self.cwd`` so bash commands keep working.
         """
         try:
             with open(self._cwd_file, encoding="utf-8") as f:
                 cwd_path = f.read().strip()
             if _IS_WINDOWS:
-                cwd_path = _msys_to_windows_path(cwd_path)
-            if cwd_path and os.path.isdir(cwd_path):
-                self.cwd = cwd_path
+                win_path = _msys_to_windows_path(cwd_path)
+                if cwd_path and os.path.isdir(win_path):
+                    self.cwd = _windows_to_msys_path(win_path)
+            else:
+                if cwd_path and os.path.isdir(cwd_path):
+                    self.cwd = cwd_path
         except (OSError, FileNotFoundError):
             pass
 
@@ -715,28 +763,25 @@ class LocalEnvironment(BaseEnvironment):
         self._extract_cwd_from_output(result)
 
     def _extract_cwd_from_output(self, result: dict):
-        """Same semantics as the base class, but on Windows the value
-        emitted by ``pwd -P`` inside Git Bash is in MSYS form
-        (``/c/Users/x``). Normalize to native Windows form and validate
-        the directory exists before assigning to ``self.cwd`` — otherwise
-        ``_run_bash``'s safe-cwd recovery would warn on every subsequent
-        command.
+        """Parse the CWD marker from stdout output.
+
+        On Windows, ``pwd -P`` inside Git Bash emits MSYS paths
+        (``/c/Users/x``).  We validate via the Windows form, then store
+        the POSIX form so subsequent bash ``cd`` commands keep working.
 
         Always defers to the base class for stripping the marker text from
         ``result["output"]`` so output formatting is identical.
         """
-        # Snapshot pre-existing cwd, defer to base for parsing + marker
-        # stripping, then validate / normalize whatever it assigned.
         prev_cwd = self.cwd
         super()._extract_cwd_from_output(result)
         if self.cwd != prev_cwd:
-            normalized = _msys_to_windows_path(self.cwd) if _IS_WINDOWS else self.cwd
-            if normalized and os.path.isdir(normalized):
-                self.cwd = normalized
-            else:
-                # Stale / non-existent path — keep previous cwd; _run_bash
-                # will resolve a safe fallback on the next call if needed.
-                self.cwd = prev_cwd
+            if _IS_WINDOWS:
+                normalized = _msys_to_windows_path(self.cwd)
+                if normalized and os.path.isdir(normalized):
+                    self.cwd = _windows_to_msys_path(normalized)
+                else:
+                    # Stale / non-existent path — rollback
+                    self.cwd = prev_cwd
 
     def cleanup(self):
         """Clean up temp files."""
