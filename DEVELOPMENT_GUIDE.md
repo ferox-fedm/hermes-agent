@@ -401,7 +401,24 @@ Add to **every profile's `.env`** AND the root `.env`:
 MYPROVIDER_API_KEY=sk-...
 ```
 
-### Step 5: Add to UI Hardcoded Lists (if needed)
+### Step 5: Add to HERMES_OVERLAYS (Required for model switch)
+
+**This step is mandatory.** The provider plugin registers for catalog and
+auth, but the model switch uses a separate `HERMES_OVERLAYS` dict in
+`hermes_cli/providers.py`. Without an overlay entry, `resolve_provider_full()`
+returns None and model switching fails with "Unknown provider".
+
+```python
+# hermes_cli/providers.py — add to HERMES_OVERLAYS dict
+"myprovider": HermesOverlay(
+    transport="openai_chat",          # or "anthropic_messages", "codex_responses"
+    extra_env_vars=("MYPROVIDER_API_KEY",),
+    base_url_override="https://api.myprovider.com/v1",
+    base_url_env_var="MYPROVIDER_BASE_URL",  # optional: env var for base URL override
+),
+```
+
+### Step 6: Add to UI Hardcoded Lists (if needed)
 
 For the provider to show in the Settings/Env pages with proper metadata:
 
@@ -421,7 +438,7 @@ For the provider to show in the Settings/Env pages with proper metadata:
 { prefix: "MYPROVIDER_", name: "My Provider", priority: N },
 ```
 
-### Step 6: Clear Cache and Test
+### Step 7: Clear Cache and Test
 
 ```python
 from hermes_cli.models import clear_provider_models_cache
@@ -652,7 +669,20 @@ actual response format.
 **Fix:** Set `User-Agent: hermes-cli` header. The base `fetch_models()`
 already does this, but custom overrides must include it.
 
-### 5. CANONICAL_PROVIDERS Auto-Extension
+### 5. HERMES_OVERLAYS Missing (Model Switch Fails)
+
+**Symptom:** "Unknown provider 'myprovider'" when trying to switch models.
+
+**Cause:** The provider plugin registers for catalog/auth via
+`providers.register_provider()`, but the model switch uses a separate
+`HERMES_OVERLAYS` dict in `hermes_cli/providers.py`. Without an overlay
+entry, `resolve_provider_full()` returns None.
+
+**Fix:** Add a `HermesOverlay` entry to `HERMES_OVERLAYS` in
+`hermes_cli/providers.py`. Every new provider needs BOTH a plugin AND
+an overlay entry.
+
+### 6. CANONICAL_PROVIDERS Auto-Extension
 
 **Symptom:** "My provider plugin exists but doesn't appear in the picker."
 
@@ -662,7 +692,7 @@ with `auth_type="api_key"`. OAuth providers need manual addition.
 **Fix:** For OAuth providers, add a `ProviderEntry` to `CANONICAL_PROVIDERS`
 in `models.py`.
 
-### 6. OpenRouter Live Fetch 403
+### 7. OpenRouter Live Fetch 403
 
 **Symptom:** "OpenRouter only shows curated models, not all free ones."
 
@@ -672,7 +702,7 @@ The fetch fails silently and falls back to the curated cache.
 **Fix:** Network issue. The code falls back gracefully. With VPN or
 different network, the live fetch succeeds and free models appear.
 
-### 7. Frontend Not Rebuilt
+### 8. Frontend Not Rebuilt
 
 **Symptom:** "I changed constants.ts but the UI still shows old data."
 
