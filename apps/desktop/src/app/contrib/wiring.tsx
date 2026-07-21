@@ -51,6 +51,7 @@ import {
   setCurrentBranch,
   setCurrentCwd,
   setCurrentModel,
+  setCurrentModelSource,
   setCurrentProvider,
   setMessages
 } from '@/store/session'
@@ -70,10 +71,13 @@ import { ModelVisibilityOverlay } from '../model-visibility-overlay'
 import { PetGenerateOverlay } from '../pet-generate/pet-generate-overlay'
 import { FileActionDialogs } from '../right-sidebar/file-actions'
 import { RemoteFolderPicker } from '../right-sidebar/files/remote-picker'
+import { resetProjectTreeState } from '../right-sidebar/files/use-project-tree'
 import { PersistentTerminal } from '../right-sidebar/terminal/persistent'
+import { closeAllTerminals } from '../right-sidebar/terminal/terminals'
 import { CRON_ROUTE, routeSessionId, sessionRoute, SETTINGS_ROUTE, syncWorkspaceIsPage } from '../routes'
 import { SessionPickerOverlay } from '../session-picker-overlay'
 import { SessionSwitcher } from '../session-switcher'
+import { useBackgroundQueueDrain } from '../session/hooks/use-background-queue-drain'
 import { useContextSuggestions } from '../session/hooks/use-context-suggestions'
 import { useCwdActions } from '../session/hooks/use-cwd-actions'
 import { useHermesConfig } from '../session/hooks/use-hermes-config'
@@ -87,7 +91,6 @@ import { useSessionListActions } from '../session/hooks/use-session-list-actions
 import { useSessionStateCache } from '../session/hooks/use-session-state-cache'
 import { useOverlayRouting } from '../shell/hooks/use-overlay-routing'
 import { useWindowControlsOverlayWidth } from '../shell/hooks/use-window-controls-overlay-width'
-import { KeybindPanel } from '../shell/keybind-panel'
 import { titlebarControlsPosition } from '../shell/titlebar'
 import { TitlebarControls } from '../shell/titlebar-controls'
 import { UpdatesOverlay } from '../updates-overlay'
@@ -147,10 +150,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   routeTokenRef.current = routeToken
   const getRouteToken = useCallback(() => routeTokenRef.current, [])
 
-  const getRoutedStoredSessionId = useCallback(
-    () => routedSessionIdRef.current,
-    []
-  )
+  const getRoutedStoredSessionId = useCallback(() => routedSessionIdRef.current, [])
 
   const clearRoutedSessionIntent = useCallback(() => {
     routedSessionIdRef.current = null
@@ -175,6 +175,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     openCommandCenterSection,
     openStarmap,
     profilesOpen,
+    resetOverlayReturnRoute,
     settingsOpen,
     starmapOpen,
     toggleCommandCenter
@@ -245,6 +246,15 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   })
 
   const openProviderSettings = useCallback(() => navigate(`${SETTINGS_ROUTE}?tab=providers`), [navigate])
+
+  // Palette "Keyboard shortcuts" entry dispatches a custom event (contributions
+  // don't have router access); listen and navigate to the settings keybinds tab.
+  useEffect(() => {
+    const onOpenKeybinds = () => navigate(`${SETTINGS_ROUTE}?tab=keybinds`)
+    window.addEventListener('hermes:open-keybinds', onOpenKeybinds)
+
+    return () => window.removeEventListener('hermes:open-keybinds', onOpenKeybinds)
+  }, [navigate])
 
   // Post-turn rehydrate from stored history (same behavior as DesktopController,
   // including finished-todos restoration).
@@ -387,6 +397,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     creatingSessionRef,
     ensureSessionState,
     getRouteToken,
+    getRoutedStoredSessionId,
     navigate,
     onFreshDraftRouteIntent: clearRoutedSessionIntent,
     requestGateway,
@@ -425,11 +436,13 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     }
 
     lastGatewayProfileRef.current = activeGatewayProfile
-    // Force: the new profile has its own default, so reseed even if the
-    // composer already shows the previous profile's model.
+    // Force: the new profile has its own defaults, so reseed the selector even
+    // if the composer already shows values from the previous profile. Both
+    // refreshes carry an intent token so a picker click made in flight wins.
     void refreshCurrentModel(true)
+    void refreshHermesConfig(true)
     void refreshActiveProfile()
-  }, [activeGatewayProfile, refreshCurrentModel])
+  }, [activeGatewayProfile, refreshCurrentModel, refreshHermesConfig])
 
   // New session anchored to a workspace (sidebar "+" on a project/worktree).
   // Seeds cwd + branch from the clicked workspace; an explicit worktree path
@@ -530,6 +543,15 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     updateSessionState
   })
 
+  // Runs outside the selected ChatBar so queues belonging to background
+  // sessions continue once those sessions are idle.
+  useBackgroundQueueDrain({
+    enabled: gatewayState === 'open',
+    runtimeIdByStoredSessionIdRef,
+    selectedStoredSessionId,
+    submitText
+  })
+
   // Session-tile delegate (resume/submit/interrupt/slash + the session verbs
   // the tile TAB menu needs, without touching the primary view).
   useSessionTileDelegate({
@@ -613,6 +635,12 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   )
 
   useGatewayBoot({
+    beforeConnectionSwitch: () => {
+      startFreshSessionDraft({ preserveRoute: true, workspaceTarget: null })
+      resetOverlayReturnRoute()
+      resetProjectTreeState()
+      closeAllTerminals()
+    },
     handleGatewayEvent: handleGatewayEventWithPlugins,
     onConnectionReady: c => {
       connectionRef.current = c
@@ -633,6 +661,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   // Keep app data live while the gateway is open (on-connect reseed + the
   // cron / messaging / transcript visibility polls + fresh-draft reseed).
   useBackgroundSync({
+    activeGatewayProfile,
     activeIsMessaging,
     activeSessionId,
     freshDraftReady,
@@ -898,7 +927,8 @@ export function ContribWiring({ children }: { children: ReactNode }) {
             onMainModelChanged={(provider, model) => {
               setCurrentProvider(provider)
               setCurrentModel(model)
-              updateModelOptionsCache(provider, model, true)
+              setCurrentModelSource('default')
+              updateModelOptionsCache($activeSessionId.get(), provider, model, true)
               void refreshCurrentModel()
               void queryClient.invalidateQueries({ queryKey: ['model-options'] })
             }}
@@ -944,9 +974,6 @@ export function ContribWiring({ children }: { children: ReactNode }) {
           <StarmapView onClose={closeOverlayToPreviousRoute} />
         </Suspense>
       )}
-
-      {/* The full hotkey map (⌘/ and the titlebar keyboard button). */}
-      <KeybindPanel />
 
       {/* Toasts above everything. */}
       <NotificationStack />

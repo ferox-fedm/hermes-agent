@@ -10,9 +10,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 from dataclasses import dataclass, field
-from typing import Any, Mapping, List
+from typing import Any, Mapping
 
 from utils import safe_json_loads
 from agent.tool_result_classification import file_mutation_result_landed
@@ -72,7 +71,6 @@ class ToolCallGuardrailConfig:
 
     warnings_enabled: bool = True
     hard_stop_enabled: bool = False
-    absolute_halt_after: int = 5
     exact_failure_warn_after: int = 2
     exact_failure_block_after: int = 5
     same_tool_failure_warn_after: int = 3
@@ -99,10 +97,6 @@ class ToolCallGuardrailConfig:
         return cls(
             warnings_enabled=_as_bool(data.get("warnings_enabled"), defaults.warnings_enabled),
             hard_stop_enabled=_as_bool(data.get("hard_stop_enabled"), defaults.hard_stop_enabled),
-            absolute_halt_after=_positive_int(
-                data.get("absolute_halt_after"),
-                defaults.absolute_halt_after,
-            ),
             exact_failure_warn_after=_positive_int(
                 warn_after.get("exact_failure", data.get("exact_failure_warn_after")),
                 defaults.exact_failure_warn_after,
@@ -246,28 +240,10 @@ class ToolCallGuardrailController:
 
     def before_call(self, tool_name: str, args: Mapping[str, Any] | None) -> ToolGuardrailDecision:
         signature = ToolCallSignature.from_call(tool_name, _coerce_args(args))
-
-        # Absolute safety net: always block when the same exact call has failed
-        # too many times, regardless of hard_stop_enabled.
-        exact_count = self._exact_failure_counts.get(signature, 0)
-        if exact_count >= self.config.absolute_halt_after:
-            decision = ToolGuardrailDecision(
-                action="halt",
-                code="absolute_halt",
-                message=(
-                    f"Absolute halt on {tool_name}: identical call failed {exact_count} "
-                    "times. Stop repeating this exact call and change your approach."
-                ),
-                tool_name=tool_name,
-                count=exact_count,
-                signature=signature,
-            )
-            self._halt_decision = decision
-            return decision
-
         if not self.config.hard_stop_enabled:
             return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
 
+        exact_count = self._exact_failure_counts.get(signature, 0)
         if exact_count >= self.config.exact_failure_block_after:
             decision = ToolGuardrailDecision(
                 action="block",
@@ -316,24 +292,6 @@ class ToolCallGuardrailController:
     ) -> ToolGuardrailDecision:
         args = _coerce_args(args)
         signature = ToolCallSignature.from_call(tool_name, args)
-
-        # Absolute halt after (post-execution): same logic as before_call.
-        exact_count = self._exact_failure_counts.get(signature, 0)
-        if exact_count >= self.config.absolute_halt_after:
-            decision = ToolGuardrailDecision(
-                action="halt",
-                code="absolute_halt",
-                message=(
-                    f"Absolute halt on {tool_name}: identical call failed {exact_count} "
-                    "times. Stop repeating this exact call and change your approach."
-                ),
-                tool_name=tool_name,
-                count=exact_count,
-                signature=signature,
-            )
-            self._halt_decision = decision
-            return decision
-
         if failed is None:
             failed, _ = classify_tool_failure(tool_name, result)
 
@@ -388,47 +346,6 @@ class ToolCallGuardrailController:
 
         self._exact_failure_counts.pop(signature, None)
         self._same_tool_failure_counts.pop(tool_name, None)
-
-        # same_output_halt: any tool (including terminal) returning identical
-        # non-trivial results too many times is halted to prevent infinite loops.
-        result_hash = _result_hash(result)
-        if result and len(result.strip()) > 64:
-            prev = self._no_progress.get(signature)
-            repeat_count = 0
-            if prev and prev[0] == result_hash:
-                repeat_count = prev[1] + 1
-            self._no_progress[signature] = (result_hash, repeat_count)
-
-            if repeat_count >= 5:
-                decision = ToolGuardrailDecision(
-                    action="halt",
-                    code="same_output_halt",
-                    message=(
-                        f"Halted {tool_name}: identical non-trivial result returned "
-                        f"{repeat_count} times. Stop repeating the same call/strategy "
-                        "and try a different approach."
-                    ),
-                    tool_name=tool_name,
-                    count=repeat_count,
-                    signature=signature,
-                )
-                self._halt_decision = decision
-                return decision
-
-            if self.config.warnings_enabled and repeat_count >= self.config.no_progress_warn_after:
-                return ToolGuardrailDecision(
-                    action="warn",
-                    code="idempotent_no_progress_warning",
-                    message=(
-                        f"{tool_name} returned the same result {repeat_count} times. "
-                        "Use the result already provided or change the query instead of "
-                        "repeating it unchanged."
-                    ),
-                    tool_name=tool_name,
-                    count=repeat_count,
-                    signature=signature,
-                )
-            return ToolGuardrailDecision(tool_name=tool_name, count=repeat_count, signature=signature)
 
         if not self._is_idempotent(tool_name):
             self._no_progress.pop(signature, None)
@@ -555,47 +472,8 @@ def _positive_int(value: Any, default: int) -> int:
 
 
 def _sha256(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
-
-
-class TextOutputGuardrailController:
-    """Detects repeated assistant text output across turns (post-compression
-    behavioral loops).
-
-    Tracks a rolling window of normalised text hashes. When the same output
-    appears 2+ times within the window, returns a ``warn`` decision so the
-    caller can surface a guidance message. History is cleared when a new user
-    message arrives (via ``on_user_input_or_progress``), NOT on tool success,
-    so that ``Text A -> Tool -> Text A`` loops are still detected.
-    """
-
-    def __init__(self, window: int = 4):
-        self.window = window
-        self._recent: List[str] = []
-
-    def observe(self, text: str) -> ToolGuardrailDecision:
-        """Record an assistant output and check for repetition."""
-        normalized = re.sub(r"\s+", " ", (text or "").strip()).lower()
-        h = hashlib.sha256(normalized.encode()).hexdigest()[:16]
-        self._recent.append(h)
-        if len(self._recent) > self.window:
-            self._recent = self._recent[-self.window:]
-        count = self._recent.count(h)
-        if count >= 2:
-            return ToolGuardrailDecision(
-                action="warn",
-                code="repeated_output",
-                message=(
-                    "Your response closely matches a recent one "
-                    f"({count} times in last {self.window} turns). "
-                    "This may indicate repetition after context compaction. "
-                    "Review the summary above for completed work and "
-                    "continue from the current state."
-                ),
-                count=count,
-            )
-        return ToolGuardrailDecision()
-
-    def on_user_input_or_progress(self) -> None:
-        """Clear history when a new user message arrives."""
-        self._recent.clear()
+    # surrogatepass: tool results scraped from the web can carry unpaired
+    # UTF-16 surrogates (e.g. half of a mathematical-bold pair); a strict
+    # encode raises and takes down the whole conversation loop. The hash only
+    # needs deterministic bytes, not valid UTF-8.
+    return hashlib.sha256(value.encode("utf-8", "surrogatepass")).hexdigest()
