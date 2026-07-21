@@ -702,7 +702,22 @@ The fetch fails silently and falls back to the curated cache.
 **Fix:** Network issue. The code falls back gracefully. With VPN or
 different network, the live fetch succeeds and free models appear.
 
-### 8. Frontend Not Rebuilt
+### 8. probe_api_models Response Format (Model Switch Fails)
+
+**Symptom:** "Model `x` was not found in this provider's model listing"
+even though the model exists in the picker.
+
+**Cause:** `probe_api_models()` in `models.py` fetches the live model
+list to validate model switches. It only checked `data.get("data", [])`
+but some providers (Rewind) return `{"models": [...]}` instead. The
+list comes back empty and every model is rejected.
+
+**Fix:** Check both `"data"` and `"models"` keys:
+```python
+items = data.get("data") or data.get("models") or []
+```
+
+### 9. Frontend Not Rebuilt
 
 **Symptom:** "I changed constants.ts but the UI still shows old data."
 
