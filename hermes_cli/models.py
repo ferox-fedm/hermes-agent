@@ -3820,8 +3820,11 @@ def probe_api_models(
         try:
             with _urlopen_model_catalog_request(req, timeout=timeout) as resp:
                 data = json.loads(resp.read().decode())
+                # Standard OpenAI: {"data": [...]}. Some providers (Rewind)
+                # use {"models": [...]} instead.
+                items = data.get("data") or data.get("models") or []
                 return {
-                    "models": [m.get("id", "") for m in data.get("data", [])],
+                    "models": [m.get("id", "") for m in items if isinstance(m, dict)],
                     "probed_url": url,
                     "resolved_base_url": candidate_base.rstrip("/"),
                     "suggested_base_url": alternate_base if alternate_base != candidate_base else normalized,
