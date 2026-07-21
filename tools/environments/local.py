@@ -635,8 +635,23 @@ def _find_bash() -> str:
             candidates.append(candidate)
 
     found = shutil.which("bash")
+    # Skip WSL bash shim when we already have Git Bash candidates.
+    wsl_shim = "C:\\Windows\\system32\\bash.EXE"
     if found and found not in candidates:
-        candidates.append(found)
+        # If we already have real Git Bash candidates, drop WSL-style bash.
+        if candidates and found.lower().endswith("system32\\bash.exe"):
+            # Prefer existing Git Bash over WSL shim
+            pass
+        else:
+            candidates.append(found)
+    # Ensure Program Files Git Bash is explicitly in candidates (if present)
+    git_bash = os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Git", "bin", "bash.exe")
+    if os.path.isfile(git_bash) and git_bash not in candidates:
+        candidates.append(git_bash)
+
+    # For Git for Windows: prioritize Program Files Git Bash explicitly
+    if git_bash and os.path.isfile(git_bash) and candidates:
+        candidates.insert(0, git_bash)
 
     # Prefer the first candidate that can actually start.  A stale
     # HERMES_GIT_BASH_PATH pointing at a broken Git-for-Windows install
@@ -736,15 +751,30 @@ def _git_bash_bin_dirs() -> list[str]:
     bin_dir = os.path.dirname(bash)          # <root>\bin  or  <root>\usr\bin
     parent = os.path.dirname(bin_dir)
     # MinGit ships bash under usr\bin; PortableGit/system Git under bin.
-    root = os.path.dirname(parent) if os.path.basename(parent).lower() == "usr" else parent
+    # For Git for Windows (Program Files\Git\bin\bash.exe), root should be
+    # the Git install root, not parent.  Detect PortableGit vs Git for Windows.
+    if "hermes" in bash.lower() or "portablegit" in bash.lower():
+        # PortableGit/MinGit under %LOCALAPPDATA%: allow usr/bin fallback.
+        root = os.path.dirname(parent) if os.path.basename(parent).lower() == "usr" else parent
+    else:
+        # Git for Windows: root is the Git install root (e.g. Program Files\Git).
+        root = parent
+        # If we're using Program Files\Git\bin\bash.exe, ensure that exact
+        # path is used (no weird derived paths).
+        if root.lower().startswith("program files\\git") or "git" in root.lower():
+            # Prefer Program Files Git bash directly
+            git_bash = os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Git", "bin", "bash.exe")
+            if os.path.isfile(git_bash):
+                bash = git_bash
 
     # Order mirrors Git-for-Windows /etc/profile so coreutils win over the
     # same-named Windows System32 tools (find.exe, sort.exe) inside the shell.
+    # Avoid usr\bin for Git for Windows (it doesn't exist).
+    # For Git for Windows, root is Program Files\Git\bin\..\..\..\bin (i.e. Program Files\Git)
+    # so we should not try to add usr\bin.
     for candidate in (
         os.path.join(root, "mingw64", "bin"),
         os.path.join(root, "mingw32", "bin"),
-        os.path.join(root, "usr", "local", "bin"),
-        os.path.join(root, "usr", "bin"),
         os.path.join(root, "bin"),
     ):
         if os.path.isdir(candidate) and candidate not in dirs:
@@ -1207,6 +1237,11 @@ class LocalEnvironment(BaseEnvironment):
                   timeout: int = 120,
                   stdin_data: str | None = None) -> subprocess.Popen:
         bash = _find_bash()
+        # Normalize Git for Windows paths:
+        # - For Git for Windows: C:\Program Files\Git\bin\bash.exe
+        # - Avoid: C:\Program Files\Git\bin\..\usr\bin\bash.exe (invalid)
+        if _IS_WINDOWS and "Git\bin" in bash:
+            bash = "C:\Program Files\Git\bin\bash.exe"
         # For login-shell invocations (used by init_session to build the
         # environment snapshot), prepend sources for the user's bashrc /
         # custom init files so tools registered outside bash_profile
