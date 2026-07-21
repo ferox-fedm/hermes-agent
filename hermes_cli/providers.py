@@ -222,6 +222,11 @@ HERMES_OVERLAYS: Dict[str, HermesOverlay] = {
         transport="bedrock_converse",
         auth_type="aws_sdk",
     ),
+    "rewind": HermesOverlay(
+        transport="openai_chat",
+        extra_env_vars=("REWIND_API_KEY",),
+        base_url_override="https://api.rewind.ai/v1",
+    ),
 }
 
 
