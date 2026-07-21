@@ -33,6 +33,7 @@ from agent.errors import EmptyStreamError
 from agent.turn_context import substitute_api_content
 from agent.gemini_native_adapter import is_native_gemini_base_url
 from agent.model_metadata import is_local_endpoint
+from agent.lmstudio_single_model import create_chat_completion_with_lmstudio_gate
 from agent.message_content import flatten_message_text
 from agent.message_sanitization import (
     _sanitize_surrogates,
@@ -429,7 +430,13 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
         # OpenAI client from the virtual runtime metadata.
         return agent.client.chat.completions.create(**api_kwargs)
     request_client = make_client("chat_completion_request")
-    return request_client.chat.completions.create(**api_kwargs)
+    return create_chat_completion_with_lmstudio_gate(
+        request_client,
+        api_kwargs,
+        provider=agent.provider,
+        base_url=agent.base_url,
+        model=api_kwargs.get("model", agent.model),
+    )
 
 
 def should_use_direct_api_call(agent) -> bool:
@@ -2087,7 +2094,13 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 _summary_result = _tsum.normalize_response(summary_response, strip_tool_prefix=agent._is_anthropic_oauth)
                 final_response = (_summary_result.content or "").strip()
             else:
-                summary_response = agent._ensure_primary_openai_client(reason="iteration_limit_summary").chat.completions.create(**summary_kwargs)
+                summary_response = create_chat_completion_with_lmstudio_gate(
+                    agent._ensure_primary_openai_client(reason="iteration_limit_summary"),
+                    summary_kwargs,
+                    provider=agent.provider,
+                    base_url=agent.base_url,
+                    model=summary_kwargs.get("model", agent.model),
+                )
                 _summary_result = agent._get_transport().normalize_response(summary_response)
                 final_response = (_summary_result.content or "").strip()
 
@@ -2130,7 +2143,13 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 if summary_extra_body:
                     summary_kwargs["extra_body"] = summary_extra_body
 
-                summary_response = agent._ensure_primary_openai_client(reason="iteration_limit_summary_retry").chat.completions.create(**summary_kwargs)
+                summary_response = create_chat_completion_with_lmstudio_gate(
+                    agent._ensure_primary_openai_client(reason="iteration_limit_summary_retry"),
+                    summary_kwargs,
+                    provider=agent.provider,
+                    base_url=agent.base_url,
+                    model=summary_kwargs.get("model", agent.model),
+                )
                 _retry_result = agent._get_transport().normalize_response(summary_response)
                 final_response = (_retry_result.content or "").strip()
 
@@ -2679,7 +2698,13 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # ``request_client_holder["diag"]`` for closure access.
         _diag = agent._stream_diag_init()
         request_client_holder["diag"] = _diag
-        stream = request_client.chat.completions.create(**stream_kwargs)
+        stream = create_chat_completion_with_lmstudio_gate(
+            request_client,
+            stream_kwargs,
+            provider=agent.provider,
+            base_url=agent.base_url,
+            model=stream_kwargs.get("model", agent.model),
+        )
         # Claim the delta sink for THIS attempt (#65991). If a prior attempt's
         # stream is somehow still alive (a stale-stream reconnect whose socket
         # abort raced), this claim supersedes it so its late chunks are fenced

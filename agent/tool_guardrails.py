@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
@@ -477,3 +478,97 @@ def _sha256(value: str) -> str:
     # encode raises and takes down the whole conversation loop. The hash only
     # needs deterministic bytes, not valid UTF-8.
     return hashlib.sha256(value.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+class TextOutputGuardrailController:
+    """Cross-turn controller for detecting repeated text output patterns.
+
+    Maintains a rolling window of normalized text hashes across turns.
+    Warns when the same output appears 2+ times within the window.
+    Clears only on user input to preserve loop detection across turns.
+    """
+
+    def __init__(self, window_size: int = 4, warn_threshold: int = 2):
+        """Initialize the controller.
+
+        Args:
+            window_size: Number of recent outputs to track (default: 4 turns)
+            warn_threshold: Number of identical outputs before warning (default: 2)
+        """
+        self.window_size = window_size
+        self.warn_threshold = warn_threshold
+        self._output_hashes: list[str] = []
+        self._warning_count: int = 0
+
+    def on_user_input(self) -> None:
+        """Clear the output history on new user input.
+
+        This preserves loop detection across turns while allowing fresh
+        starts when the user provides new input.
+        """
+        self._output_hashes.clear()
+        self._warning_count = 0
+
+    def observe_output(self, text: str) -> ToolGuardrailDecision:
+        """Observe a text output and check for repeated patterns.
+
+        Args:
+            text: The normalized text output to observe
+
+        Returns:
+            ToolGuardrailDecision with action='warn' if repeated pattern detected,
+            otherwise action='allow'
+        """
+        if not text or len(text) < 64:
+            # Skip very short outputs - they're likely not meaningful loops
+            return ToolGuardrailDecision()
+
+        # Normalize and hash the output
+        normalized = _normalize_text_output(text)
+        text_hash = _sha256(normalized)
+
+        # Add to rolling window
+        self._output_hashes.append(text_hash)
+        if len(self._output_hashes) > self.window_size:
+            self._output_hashes = self._output_hashes[-self.window_size:]
+
+        # Count occurrences of this hash in the window
+        count = self._output_hashes.count(text_hash)
+
+        if count >= self.warn_threshold:
+            self._warning_count += 1
+            return ToolGuardrailDecision(
+                action="warn",
+                code="text_output_loop_detected",
+                message=(
+                    f"The same text output has appeared {count} times in the "
+                    f"last {self.window_size} turns. This may indicate a behavioral "
+                    "loop. Consider changing your approach or asking the user "
+                    "for clarification."
+                ),
+                count=count,
+            )
+
+        return ToolGuardrailDecision()
+
+    @property
+    def warning_count(self) -> int:
+        """Return the total number of warnings issued this session."""
+        return self._warning_count
+
+
+def _normalize_text_output(text: str) -> str:
+    """Normalize text output for comparison.
+
+    Strips whitespace, collapses multiple newlines, and lowercases
+    for consistent comparison across similar outputs.
+    """
+    if not text:
+        return ""
+    # Strip leading/trailing whitespace
+    normalized = text.strip()
+    # Collapse multiple newlines to single
+    normalized = re.sub(r'\n\s*\n', '\n', normalized)
+    # Collapse multiple spaces to single
+    normalized = re.sub(r' +', ' ', normalized)
+    return normalized.lower()

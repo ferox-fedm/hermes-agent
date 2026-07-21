@@ -5159,7 +5159,21 @@ def run_conversation(
             else:
                 # No tool calls - this is the final response
                 final_response = assistant_message.content or ""
-                
+
+                # Observe text output for loop detection
+                if hasattr(agent, '_text_output_guardrails') and final_response:
+                    _text_decision = agent._text_output_guardrails.observe_output(final_response)
+                    if _text_decision.action == "warn":
+                        logger.warning(
+                            "Text output loop detected: %s",
+                            _text_decision.message,
+                        )
+                        if not agent.quiet_mode:
+                            agent._vprint(
+                                f"\n{agent.log_prefix}⚠️  {_text_decision.message}",
+                                force=True,
+                            )
+
                 # Fix: unmute output when entering the no-tool-call branch
                 # so the user can see empty-response warnings and recovery
                 # status messages.  _mute_post_response was set during a

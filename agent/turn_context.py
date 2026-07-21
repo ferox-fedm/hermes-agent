@@ -472,6 +472,10 @@ def build_turn_context(
     current_turn_user_idx = len(messages) - 1
     agent._persist_user_message_idx = current_turn_user_idx
 
+    # Reset text output guardrails on new user input to preserve loop detection
+    if hasattr(agent, '_text_output_guardrails'):
+        agent._text_output_guardrails.on_user_input()
+
     # Track user turns for memory flush and periodic nudge logic.
     agent._user_turn_count += 1
     # Copilot x-initiator: the first API call of this user turn is
