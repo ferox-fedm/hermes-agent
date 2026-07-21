@@ -1,0 +1,5 @@
+name: rewind-provider
+kind: model-provider
+version: 1.0.0
+description: Rewind AI
+author: Nous Research

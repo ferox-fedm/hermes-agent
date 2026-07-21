@@ -210,6 +210,13 @@ export const PROVIDER_GROUPS: ProviderPrefix[] = [
     description: 'Authenticate via AWS profile + region',
     docsUrl: 'https://docs.aws.amazon.com/bedrock/latest/userguide/bedrock-regions.html',
     priority: 23
+  },
+  {
+    prefix: 'REWIND_',
+    name: 'Rewind AI',
+    description: '300+ models via OpenAI-compatible API',
+    docsUrl: 'https://rewind.ai',
+    priority: 24
   }
 ]
 
