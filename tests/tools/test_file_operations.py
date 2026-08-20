@@ -467,13 +467,14 @@ class TestShellFileOpsHelpers:
         # Should be safely escaped
         assert result.count("'") >= 4  # wrapping + escaping
 
-    def test_escape_shell_arg_rewrites_windows_drive_paths_to_msys(self, monkeypatch, file_ops):
-        # bash eats backslashes and MSYS mangles ``C:\...``; the Git Bash
-        # ``/c/...`` form is the reliable one (reuses _windows_to_msys_path).
+    def test_escape_shell_arg_rewrites_windows_drive_paths_to_native_slash(self, monkeypatch, file_ops):
+        # bash eats backslashes, and Hermes disables MSYS argv conversion so
+        # the MSYS ``/c/...`` form would reach native exes literally. The
+        # native forward-slash ``C:/...`` form is the reliable one.
         import tools.environments.local as local_mod
 
         monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
-        assert file_ops._escape_shell_arg(r"C:\Users\alice\notes.txt") == "'/c/Users/alice/notes.txt'"
+        assert file_ops._escape_shell_arg(r"C:\Users\alice\notes.txt") == "'C:/Users/alice/notes.txt'"
         # Non-drive paths are untouched.
         assert file_ops._escape_shell_arg("/tmp/foo") == "'/tmp/foo'"
 
@@ -483,7 +484,7 @@ class TestShellFileOpsHelpers:
         monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
         mixed = r"/c/Users/Alexander\Documents\NewTEST\readme.txt"
         assert file_ops._escape_shell_arg(mixed) == (
-            "'/c/Users/Alexander/Documents/NewTEST/readme.txt'"
+            "'C:/Users/Alexander/Documents/NewTEST/readme.txt'"
         )
 
     def test_escape_shell_arg_rewrites_forward_slash_native_paths(self, monkeypatch, file_ops):
@@ -492,7 +493,7 @@ class TestShellFileOpsHelpers:
         monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
         assert file_ops._escape_shell_arg(
             "C:/Users/alice/notes.txt"
-        ) == "'/c/Users/alice/notes.txt'"
+        ) == "'C:/Users/alice/notes.txt'"
 
     def test_read_file_uses_bash_safe_windows_paths(self, mock_env, monkeypatch):
         import tools.environments.local as local_mod
@@ -517,10 +518,10 @@ class TestShellFileOpsHelpers:
         result = ops.read_file(r"C:\Users\alice\notes.txt")
 
         assert result.error is None
-        assert commands[0] == "wc -c < '/c/Users/alice/notes.txt' 2>/dev/null"
-        assert commands[1] == "head -c 1000 '/c/Users/alice/notes.txt' 2>/dev/null"
-        assert commands[2] == "sed -n '1,500p' '/c/Users/alice/notes.txt'"
-        assert commands[3] == "wc -l < '/c/Users/alice/notes.txt'"
+        assert commands[0] == "wc -c < 'C:/Users/alice/notes.txt' 2>/dev/null"
+        assert commands[1] == "head -c 1000 'C:/Users/alice/notes.txt' 2>/dev/null"
+        assert commands[2] == "sed -n '1,500p' 'C:/Users/alice/notes.txt'"
+        assert commands[3] == "wc -l < 'C:/Users/alice/notes.txt'"
 
     def test_is_likely_binary_by_extension(self, file_ops):
         assert file_ops._is_likely_binary("photo.png") is True
@@ -703,12 +704,26 @@ class TestSearchFilesFallbackHiddenPaths:
         env.cwd = "/"
 
         def execute(command, **kwargs):
-            completed = subprocess.run(
-                command,
-                shell=True,
-                text=True,
-                capture_output=True,
-            )
+            # Run through the same shell the production file tools use (Git
+            # Bash on Windows, /bin/sh on POSIX) so the find/glob behavior
+            # matches what actually ships. ``shell=True`` alone would use
+            # cmd.exe on Windows, which is not what the tools do.
+            import tools.environments.local as local_mod
+
+            shell = local_mod._find_bash() if local_mod._IS_WINDOWS else None
+            if shell:
+                completed = subprocess.run(
+                    [shell, "-c", command],
+                    text=True,
+                    capture_output=True,
+                )
+            else:
+                completed = subprocess.run(
+                    command,
+                    shell=True,
+                    text=True,
+                    capture_output=True,
+                )
             return {
                 "output": completed.stdout,
                 "returncode": completed.returncode,
@@ -735,7 +750,13 @@ class TestSearchFilesFallbackHiddenPaths:
         result = ops._search_files("*.log", str(root), limit=50, offset=0)
 
         assert result.error is None
-        assert set(result.files) == {str(visible_file), str(visible_nested_file)}
+        # Separator-insensitive: the shell layer may return forward-slash
+        # form on Windows (find/rg echo the path form they were given).
+        canon = lambda p: p.replace("\\", "/")
+        assert {canon(f) for f in result.files} == {
+            canon(str(visible_file)),
+            canon(str(visible_nested_file)),
+        }
 
     def test_normal_root_still_excludes_hidden_descendants(self, tmp_path, monkeypatch):
         """Fallback find should still exclude hidden descendant paths for normal roots."""
@@ -754,7 +775,11 @@ class TestSearchFilesFallbackHiddenPaths:
         result = ops._search_files("*.log", str(root), limit=50, offset=0)
 
         assert result.error is None
-        assert set(result.files) == {str(visible_file), str(visible_nested_file)}
+        canon = lambda p: p.replace("\\", "/")
+        assert {canon(f) for f in result.files} == {
+            canon(str(visible_file)),
+            canon(str(visible_nested_file)),
+        }
 
 
 class TestShellFileOpsWriteDenied:

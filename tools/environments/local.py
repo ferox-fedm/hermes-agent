@@ -107,26 +107,57 @@ def _windows_to_msys_path(cwd: str) -> str:
     return f"/{drive}/{tail}" if tail else f"/{drive}/"
 
 
-def _bash_safe_path(path: str) -> str:
-    """Return *path* in a form safe to embed in a Git Bash script.
+def _windows_to_native_slash_path(path: str) -> str:
+    """Translate a Windows path to the native forward-slash form
+    (``C:/Users/x``) that is safe to embed in a Git Bash script.
 
-    Native ``C:\\Users\\x`` / ``C:/Users/x`` → ``/c/Users/x`` via
-    :func:`_windows_to_msys_path`. Mixed MSYS leftovers
-    (``/c/Users\\Alexander\\Documents``) get backslashes normalized so
-    bash does not eat ``\\U`` and trip the ``Directory \\drivers\\etc``
-    failure class. No-op off Windows and for empty input.
+    Hermes runs every terminal/file-tool command through Git Bash with MSYS
+    argv path conversion *disabled* (``MSYS_NO_PATHCONV=1`` +
+    ``MSYS2_ARG_CONV_EXCL=*``) so native Windows commands like ``tasklist``
+    don't get their ``/FO``-style flags mangled (#56700). With conversion
+    off, an MSYS-form argument (``/c/Users/x``) reaches a native exe such as
+    ``rg`` *literally* — no MSYS runtime translates it back to ``C:\\...`` —
+    and the exe fails with "path not found". The native forward-slash form
+    ``C:/Users/x`` is understood by bash builtins, MSYS-runtime GNU tools,
+    and native Windows exes alike, and it can never be mangled by MSYS
+    because it does not look like a POSIX path (no leading ``/``).
 
-    ``get_temp_dir`` already emits forward-slash ``C:/...`` forms for
-    Python compatibility; those still need the ``/c/...`` rewrite —
-    MSYS argument conversion treats ``C:/...`` as a Windows path and
-    can corrupt the login-shell ``drivers\\etc`` lookup.
+    No-ops off Windows or for empty input.
     """
     if not _IS_WINDOWS or not path:
         return path
-    path = _windows_to_msys_path(path)
+    # MSYS / cygdrive / WSL-mnt form (``/c/Users/x``) → native drive form.
+    native = _msys_to_windows_path(path)
+    if native != path:
+        return native.replace("\\", "/")
+    # Native drive form (``C:\x`` / ``C:/x``) → normalize separators.
+    if re.match(r'^[a-zA-Z]:[\\/]?', path):
+        return path.replace("\\", "/")
+    # UNC (``\\server\share``) or other backslashed form → normalize so bash
+    # does not eat the backslashes.
     if "\\" in path:
-        path = path.replace("\\", "/")
+        return path.replace("\\", "/")
     return path
+
+
+def _bash_safe_path(path: str) -> str:
+    """Return *path* in a form safe to embed in a Git Bash script.
+
+    Native ``C:\\Users\\x`` / ``C:/Users/x`` and MSYS leftovers
+    (``/c/Users\\Alexander\\Documents``) are all normalized to the native
+    forward-slash form (``C:/Users/x``) via
+    :func:`_windows_to_native_slash_path`. That form is understood by bash
+    builtins, MSYS-runtime GNU tools, and native Windows exes alike, and —
+    critically — it is never mangled by MSYS argv conversion, which Hermes
+    disables (see :func:`_windows_to_native_slash_path`). No-op off Windows
+    and for empty input.
+
+    ``get_temp_dir`` already emits forward-slash ``C:/...`` forms for
+    Python compatibility; those pass through unchanged.
+    """
+    if not _IS_WINDOWS or not path:
+        return path
+    return _windows_to_native_slash_path(path)
 
 
 def _quote_bash_path(path: str) -> str:
@@ -867,6 +898,10 @@ def _git_bash_bin_dirs() -> list[str]:
 
     # Order mirrors Git-for-Windows /etc/profile so coreutils win over the
     # same-named Windows System32 tools (find.exe, sort.exe) inside the shell.
+    # Paths are normalized to forward slashes: these dirs are consumed both as
+    # subprocess ``cwd`` (Python accepts either form) and as PATH entries that
+    # get prepended to the bash PATH (POSIX form), and dedup/membership checks
+    # must match across both representations.
     for candidate in (
         os.path.join(root, "mingw64", "bin"),
         os.path.join(root, "mingw32", "bin"),
@@ -874,6 +909,7 @@ def _git_bash_bin_dirs() -> list[str]:
         os.path.join(root, "usr", "bin"),
         os.path.join(root, "bin"),
     ):
+        candidate = candidate.replace("\\", "/")
         if os.path.isdir(candidate) and candidate not in dirs:
             dirs.append(candidate)
 

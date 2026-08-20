@@ -961,13 +961,14 @@ class ShellFileOperations(FileOperations):
     def _escape_shell_arg(self, arg: str) -> str:
         """Escape a string for safe use in shell commands.
 
-        On Windows native drive paths (``C:\\Users\\x`` / ``C:/Users/x``)
-        and mixed MSYS leftovers (``/c/Users\\x``) are rewritten to the
-        Git Bash ``/c/Users/x`` form via ``_bash_safe_path``: bash eats
-        backslashes and MSYS otherwise mangles drive paths into the
-        ``Directory \\drivers\\etc does not exist`` failure class. Reuses
-        the env-layer translator so shell file ops and the terminal ``cd``
-        agree on the path form. No-op off Windows and for plain POSIX paths.
+        On Windows, native drive paths (``C:\\Users\\x`` / ``C:/Users/x``)
+        and MSYS leftovers (``/c/Users\\x``) are normalized to the native
+        forward-slash form (``C:/Users/x``) via ``_bash_safe_path``: that
+        form is understood by bash builtins, MSYS-runtime GNU tools, and
+        native Windows exes alike, and is never mangled by MSYS argv
+        conversion (which Hermes disables). Reuses the env-layer translator
+        so shell file ops and the terminal ``cd`` agree on the path form.
+        No-op off Windows and for plain POSIX paths.
         """
         from tools.environments.local import _bash_safe_path
 

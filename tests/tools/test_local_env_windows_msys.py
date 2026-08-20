@@ -34,6 +34,7 @@ from tools.environments.local import (
     _resolve_safe_cwd,
     _sanitize_subprocess_env,
     _windows_to_msys_path,
+    _windows_to_native_slash_path,
     hermes_subprocess_env,
 )
 
@@ -118,26 +119,74 @@ class TestWindowsToMsysPath:
 
 
 # ---------------------------------------------------------------------------
+# _windows_to_native_slash_path — native forward-slash form for bash scripts
+# ---------------------------------------------------------------------------
+
+class TestWindowsToNativeSlashPath:
+    def test_noop_on_non_windows(self, monkeypatch):
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", False)
+        assert _windows_to_native_slash_path(r"C:\Users\NVIDIA") == r"C:\Users\NVIDIA"
+        assert _windows_to_native_slash_path("/tmp/foo") == "/tmp/foo"
+
+    def test_native_backslash_path_becomes_forward_slash(self, monkeypatch):
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        assert _windows_to_native_slash_path(r"C:\Users\NVIDIA") == "C:/Users/NVIDIA"
+        assert _windows_to_native_slash_path(r"D:\Projects\foo bar") == "D:/Projects/foo bar"
+
+    def test_native_forward_slash_path_unchanged(self, monkeypatch):
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        assert _windows_to_native_slash_path("C:/Users/NVIDIA") == "C:/Users/NVIDIA"
+
+    def test_msys_path_becomes_native(self, monkeypatch):
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        assert _windows_to_native_slash_path("/c/Users/NVIDIA") == "C:/Users/NVIDIA"
+        assert _windows_to_native_slash_path("/mnt/d/Projects/foo") == "D:/Projects/foo"
+        assert _windows_to_native_slash_path("/cygdrive/c/Users/NVIDIA") == "C:/Users/NVIDIA"
+
+    def test_mixed_msys_backslash_path_becomes_native(self, monkeypatch):
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        mixed = r"/c/Users/Alexander\Documents\NewTEST\readme.txt"
+        assert _windows_to_native_slash_path(mixed) == "C:/Users/Alexander/Documents/NewTEST/readme.txt"
+
+    def test_unc_path_normalizes_backslashes(self, monkeypatch):
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        assert _windows_to_native_slash_path(r"\\server\share\file.txt") == "//server/share/file.txt"
+
+    def test_plain_posix_path_untouched(self, monkeypatch):
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        assert _windows_to_native_slash_path("/tmp/foo") == "/tmp/foo"
+        assert _windows_to_native_slash_path("relative/path") == "relative/path"
+
+    def test_empty_string(self, monkeypatch):
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        assert _windows_to_native_slash_path("") == ""
+
+
+# ---------------------------------------------------------------------------
 # _bash_safe_path / _quote_bash_path — shell-script interpolation
 # ---------------------------------------------------------------------------
 
 class TestBashSafePath:
-    def test_native_windows_path_becomes_msys(self, monkeypatch):
+    def test_native_windows_path_becomes_native_forward_slash(self, monkeypatch):
+        """Hermes disables MSYS argv conversion, so the MSYS ``/c/...`` form
+        would reach native exes (rg) literally and fail. The safe form is
+        the native forward-slash ``C:/...`` — understood by bash builtins,
+        MSYS-runtime tools, and native exes alike."""
         monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
-        assert _bash_safe_path(r"C:\Users\alice\notes.txt") == "/c/Users/alice/notes.txt"
+        assert _bash_safe_path(r"C:\Users\alice\notes.txt") == "C:/Users/alice/notes.txt"
 
-    def test_forward_slash_native_path_becomes_msys(self, monkeypatch):
-        """Production get_temp_dir emits C:/... — still needs /c/... rewrite."""
+    def test_forward_slash_native_path_unchanged(self, monkeypatch):
+        """Production get_temp_dir emits C:/... — already the safe form."""
         monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
         assert (
             _bash_safe_path("C:/Users/Alexander/.hermes/cache/terminal/hermes-snap-x.sh")
-            == "/c/Users/Alexander/.hermes/cache/terminal/hermes-snap-x.sh"
+            == "C:/Users/Alexander/.hermes/cache/terminal/hermes-snap-x.sh"
         )
 
-    def test_mixed_msys_path_normalizes_backslashes(self, monkeypatch):
+    def test_mixed_msys_path_becomes_native(self, monkeypatch):
         monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
         mixed = r"/c/Users/Alexander\Documents\NewTEST\readme.txt"
-        assert _bash_safe_path(mixed) == "/c/Users/Alexander/Documents/NewTEST/readme.txt"
+        assert _bash_safe_path(mixed) == "C:/Users/Alexander/Documents/NewTEST/readme.txt"
 
     def test_noop_off_windows(self, monkeypatch):
         monkeypatch.setattr(local_mod, "_IS_WINDOWS", False)
@@ -149,7 +198,7 @@ class TestBashSafePath:
         quoted = _quote_bash_path(
             r"C:\Users\Alexander\AppData\Local\Temp\hermes-snap-abc.sh"
         )
-        assert "/c/Users/Alexander/AppData/Local/Temp/hermes-snap-abc.sh" in quoted
+        assert "C:/Users/Alexander/AppData/Local/Temp/hermes-snap-abc.sh" in quoted
         assert "\\" not in quoted
 
 
@@ -306,6 +355,10 @@ class TestWindowsMsysPathconvDefaults:
 
     def test_no_pathconv_not_set_on_posix(self, monkeypatch):
         monkeypatch.setattr(local_mod, "_IS_WINDOWS", False)
+        # The ambient env on a real Windows host (e.g. Git Bash CI) can carry
+        # MSYS_NO_PATHCONV — strip it so the assertion tests the code path,
+        # not inherited state.
+        monkeypatch.delenv("MSYS_NO_PATHCONV", raising=False)
         assert "MSYS_NO_PATHCONV" not in _make_run_env({})
 
     def test_respects_user_override(self, monkeypatch):
@@ -323,6 +376,9 @@ class TestWindowsMsysPathconvDefaults:
 
     def test_msys2_arg_conv_excl_not_set_on_posix(self, monkeypatch):
         monkeypatch.setattr(local_mod, "_IS_WINDOWS", False)
+        # Strip ambient value (real Windows hosts carry MSYS2_ARG_CONV_EXCL)
+        # so the assertion tests the code path, not inherited state.
+        monkeypatch.delenv("MSYS2_ARG_CONV_EXCL", raising=False)
         assert "MSYS2_ARG_CONV_EXCL" not in _make_run_env({})
 
     def test_msys2_arg_conv_excl_respects_user_override(self, monkeypatch):
@@ -453,9 +509,11 @@ class TestWrapCommandWindowsNativeCwd:
         assert "builtin cd -- /c/Users/liush 2>/dev/null || true" in captured["script"]
         assert r"C:\Users\liush" not in captured["script"]
 
-    def test_init_session_bootstrap_quotes_snapshot_paths_in_msys_form(self, monkeypatch):
-        """Snapshot paths must reach bash as /c/... — C:/... still trips MSYS
-        arg conversion during bash -l and surfaces as \\drivers\\etc."""
+    def test_init_session_bootstrap_quotes_snapshot_paths_in_native_slash_form(self, monkeypatch):
+        """Snapshot paths must reach bash as native forward-slash form —
+        Hermes disables MSYS argv conversion, so the MSYS ``/c/...`` form
+        would reach native exes literally, and bare ``C:\\...`` backslashes
+        would be eaten by bash."""
         monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
 
         captured = {}
@@ -480,8 +538,7 @@ class TestWrapCommandWindowsNativeCwd:
             env.init_session()
 
         script = captured["script"]
-        assert "/c/Users/Alexander/.hermes/cache/terminal/hermes-snap-deadbeef.sh" in script
-        assert "C:/Users/Alexander" not in script
+        assert "C:/Users/Alexander/.hermes/cache/terminal/hermes-snap-deadbeef.sh" in script
         assert r"C:\Users\Alexander" not in script
 
     def test_init_session_bootstrap_rewrites_backslash_snapshot_paths(self, monkeypatch):
@@ -508,5 +565,5 @@ class TestWrapCommandWindowsNativeCwd:
             env.init_session()
 
         script = captured["script"]
-        assert "/c/Users/Alexander/AppData/Local/Temp/hermes-snap-deadbeef.sh" in script
+        assert "C:/Users/Alexander/AppData/Local/Temp/hermes-snap-deadbeef.sh" in script
         assert r"C:\Users\Alexander\AppData" not in script

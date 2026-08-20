@@ -979,7 +979,16 @@ _WINDOWS_BASH_SHELL_HINT = (
     "calls. MSYS-style paths like `/c/Users/<user>/...` work alongside "
     "native `C:\\Users\\<user>\\...` paths. PowerShell builtins "
     "(`Get-ChildItem`, `$env:FOO`, `Select-String`) will NOT work — use their "
-    "POSIX equivalents (`ls`, `$FOO`, `grep`)."
+    "POSIX equivalents (`ls`, `$FOO`, `grep`).\n"
+    "Tool ↔ path format: ONLY the `terminal` tool accepts MSYS paths "
+    "(`/c/...`, `/g/...`, `/h/...`, `/c/Users/<user>/...`). All other tools "
+    "(`read_file`, `write_file`, `patch`, `edit_file`, `execute_code`, "
+    "`vision_analyze`, `search_files`, etc.) run in Python/Node and require "
+    "Windows-style paths (`C:\\Users\\<user>\\...` or `C:/Users/<user>/...`). "
+    "Using `/g/...` style with non-terminal tools will silently fail or "
+    "produce `FileNotFoundError`. Mentions in conversation of `H:\\workspace\\...` "
+    "should be passed to `terminal` as `/h/workspace/...` (MSYS) and to "
+    "file/Python tools as `H:\\workspace\\...` (Windows). Don't mix them."
 )
 
 
