@@ -15,6 +15,7 @@ codebase for the first time.
 1. [Project Layout](#1-project-layout)
 2. [The Profile System](#2-the-profile-system)
 3. [Configuration System](#3-configuration-system)
+3.5. [Credential Pools](#35-credential-pools)
 4. [Provider Architecture](#4-provider-architecture)
 5. [Model Picker Pipeline](#5-model-picker-pipeline)
 6. [Adding a New Provider](#6-adding-a-new-provider)
@@ -204,6 +205,99 @@ Profiles are activated via:
 Or, if the provider has a plugin with `env_vars=("NEW_API_KEY",)`, the
 `_inject_profile_env_vars()` function auto-adds it to `OPTIONAL_ENV_VARS`
 at import time.
+
+---
+
+## 3.5. Credential Pools
+
+Credential pools let you register multiple API keys or OAuth tokens for the
+same provider. When one key hits a rate limit or quota, Hermes automatically
+rotates to the next healthy key.
+
+### Where Pool State Lives
+
+| What | File | Profile-aware? |
+|------|------|----------------|
+| Pool entries (keys, status, cooldowns) | `<HERMES_HOME>/auth.json` → `credential_pool` | Yes — each profile has its own |
+| Rotation strategies | `<HERMES_HOME>/config.yaml` → `credential_pool_strategies` | Yes |
+| CLI commands | `hermes auth list`, `hermes auth add`, etc. | Yes — operates on active profile |
+
+### Pool Entry Sources
+
+- **Config-seeded:** Auto-discovered from `custom_providers[].api_key` in
+  `config.yaml`. Labeled `config:<name>` in `hermes auth list`.
+- **Manual:** Added via `hermes auth add`. Labeled `manual`. Stored with
+  `access_token` field in `auth.json`.
+- **Auto-seeded:** Environment variables (`OPENROUTER_API_KEY`, etc.),
+  OAuth tokens, Claude Code credentials — discovered on pool load.
+
+### Key Commands
+
+```bash
+hermes auth list                     # Show all pools
+hermes auth list <provider>          # Show specific provider pool
+hermes auth add <provider> --type api-key --api-key <key>
+hermes auth remove <provider> <index>  # Remove by 1-based index
+hermes auth reset <provider>         # Clear all cooldowns/exhaustion
+hermes auth                          # Interactive wizard
+```
+
+### Cooldown Behavior
+
+| Error | Cooldown | Notes |
+|-------|----------|-------|
+| 401 (auth expired) | 5 minutes | Tries OAuth refresh first |
+| 429 (rate limit) | 1 hour | Retries same key once (transient) |
+| 402 (billing/quota) | 1 hour | Immediate rotation |
+| 403 (tier insufficient) | 1 hour | Uses default TTL — not a quota issue |
+
+Provider-supplied `reset_at` timestamps override these defaults.
+
+### Rotation Strategies
+
+Set in `config.yaml` under `credential_pool_strategies`:
+
+```yaml
+credential_pool_strategies:
+  openrouter: round_robin
+  anthropic: least_used
+```
+
+| Strategy | Behavior |
+|----------|----------|
+| `fill_first` (default) | First healthy key until exhausted |
+| `round_robin` | Cycle evenly through keys |
+| `least_used` | Lowest `request_count` |
+| `random` | Random among healthy keys |
+
+### Common Pitfalls
+
+1. **All keys exhausted → "no available entries"** — Every key is in cooldown.
+   Run `hermes auth reset <provider>` or wait for TTL to expire.
+
+2. **403 ≠ quota** — A 403 ("account tier insufficient") means the model
+   isn't available at the key's tier, not that quota is depleted. Dashboard
+   credits and model-tier access are separate checks.
+
+3. **Profile isolation** — Pool state is per-profile in `auth.json`. Keys
+   added in one profile don't appear in another unless you add them there
+   too (or use `hermes auth add` in each profile).
+
+4. **Key rotation resets prompt cache** — Rotating to a different key
+   mid-session loses the cached prefix. Each rotation costs one full-price
+   context pass on long conversations.
+
+5. **Manual vs config-seeded entries** — Config-seeded entries
+   (`config:FreeModel`) are auto-pruned if the env var is removed. Manual
+   entries (`manual`) persist until explicitly removed.
+
+### Architecture
+
+Core files:
+- `agent/credential_pool.py` — Pool manager: storage, selection, rotation, cooldowns
+- `hermes_cli/auth_commands.py` — CLI commands and interactive wizard
+- `agent/agent_runtime_helpers.py` — `recover_with_credential_pool()` error recovery
+- `agent/error_classifier.py` — Error classification (429, 402, 401, 403)
 
 ---
 
@@ -728,6 +822,35 @@ items = data.get("data") or data.get("models") or []
 cd apps/desktop && npm run build   # Desktop
 cd web && npm run build            # Web dashboard
 ```
+
+### 10. Context Engine Deepcopy Failure (Plugin Engines)
+
+**Symptom:** "Context engine 'lcm' could not be safely copied for this agent
+(cannot pickle 'sqlite3.Connection' object) — falling back to built-in compressor."
+
+**Cause:** When Hermes spawns child agents, it deep-copies the registered
+context engine singleton (`copy.deepcopy()` in `agent_init.py:1873`) so the
+child's `update_model()` calls don't mutate the parent's state. Plugin engines
+that hold uncopyable state (SQLite connections, locks, threading objects) fail
+the deepcopy and fall back silently to the built-in compressor.
+
+**Fix:** Implement `__deepcopy__` on the plugin engine class. The method
+should return a fresh instance via `clone_for_agent()` (or equivalent) rather
+than attempting to copy the uncopyable state:
+
+```python
+def __deepcopy__(self, memo: dict) -> "LCMEngine":
+    """Support copy.deepcopy() for child agent cloning."""
+    return self.clone_for_agent()
+```
+
+The clone shares the same database path/configuration but gets independent
+session/cursor/lifecycle runtime state.
+
+**Key files:**
+- `agent/agent_init.py:1872-1884` — deepcopy + fallback logic
+- `agent/context_engine.py` — ContextEngine ABC
+- `plugins/hermes-lcm/engine.py` — LCMEngine with `__deepcopy__`
 
 ---
 
