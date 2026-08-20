@@ -450,7 +450,7 @@ class TestShellFileOpsHelpers:
     def test_normalize_read_pagination_clamps_invalid_values(self):
         assert normalize_read_pagination(offset=0, limit=0) == (1, 1)
         assert normalize_read_pagination(offset=-10, limit=-5) == (1, 1)
-        assert normalize_read_pagination(offset="bad", limit="bad") == (1, 500)
+        assert normalize_read_pagination(offset="bad", limit="bad") == (1, 2000)
         assert normalize_read_pagination(offset=2, limit=999999) == (2, 2000)
 
     def test_normalize_search_pagination_clamps_invalid_values(self):
@@ -503,8 +503,13 @@ class TestShellFileOpsHelpers:
 
         def side_effect(command, **kwargs):
             commands.append(command)
-            if command.startswith("wc -c"):
+            # The size probe gates `wc -c` behind `[ -f ]` so a FIFO or device
+            # cannot block the read; it still reports a plain byte count.
+            if command.startswith("if [ -f ") or command.startswith("wc -c"):
                 return {"output": "5\n", "returncode": 0}
+            if command.startswith("head -c") and "| base64" in command:
+                import base64 as b64
+                return {"output": b64.b64encode(b"hello").decode(), "returncode": 0}
             if command.startswith("head -c"):
                 return {"output": "hello", "returncode": 0}
             if command.startswith("sed -n"):
@@ -518,9 +523,15 @@ class TestShellFileOpsHelpers:
         result = ops.read_file(r"C:\Users\alice\notes.txt")
 
         assert result.error is None
-        assert commands[0] == "wc -c < 'C:/Users/alice/notes.txt' 2>/dev/null"
-        assert commands[1] == "head -c 1000 'C:/Users/alice/notes.txt' 2>/dev/null"
-        assert commands[2] == "sed -n '1,500p' 'C:/Users/alice/notes.txt'"
+        assert commands[0] == (
+            "if [ -f 'C:/Users/alice/notes.txt' ]; "
+            "then wc -c < 'C:/Users/alice/notes.txt' 2>/dev/null; "
+            "elif [ -e 'C:/Users/alice/notes.txt' ]; "
+            "then echo __hermes_not_regular__; "
+            "else exit 1; fi"
+        )
+        assert commands[1] == "head -c 1000 'C:/Users/alice/notes.txt' 2>/dev/null | base64"
+        assert commands[2] == "sed -n '1,2000p' 'C:/Users/alice/notes.txt' | cut -b1-8001"
         assert commands[3] == "wc -l < 'C:/Users/alice/notes.txt'"
 
     def test_is_likely_binary_by_extension(self, file_ops):
@@ -590,7 +601,7 @@ class TestShellFileOpsHelpers:
         )
 
         def side_effect(command, **kwargs):
-            if command.startswith("wc -c"):
+            if command.startswith("if [ -f ") or command.startswith("wc -c"):
                 return {"output": "12\n", "returncode": 0}
             if command.startswith("head -c"):
                 return {"output": "print('ok')\n", "returncode": 0}
