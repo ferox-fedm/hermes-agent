@@ -260,6 +260,17 @@ export async function runRewindSubmit(
     // gateway's 4030 cross-check. Unresolved: plain resubmit, no truncation.
     resolvedOrdinal = undefined
     resolvedMessageId = undefined
+  } else if (resolvedRowId !== undefined) {
+    // A bound row id is authoritative on the gateway, which resolves the cut
+    // from it alone. The ordinal is only a cross-check, and it lives in a
+    // DIFFERENT space (client full-lineage vs gateway tip+prefix), so it can
+    // legitimately diverge — e.g. after compression the client still shows
+    // ancestor turns the gateway keeps in display_history_prefix — and the
+    // gateway refuses with 4030 even when the address is right. Drop the
+    // ordinal whenever a row id is present; a genuinely stale ADDRESS degrades
+    // to the gateway's fail-closed 4018 and the caller's refresh-and-retry
+    // recovery instead of a hard-to-read mismatch.
+    resolvedOrdinal = undefined
   }
 
   const interrupt = async () => {

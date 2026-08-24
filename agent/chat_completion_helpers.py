@@ -995,8 +995,16 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
         _completions = getattr(getattr(agent.client, "chat", None), "completions", None)
         if not callable(getattr(_completions, "prepare", None)):
             api_kwargs.pop("_moa_prepared_request", None)
+        # Ensure non-streaming request to avoid providers that default to streaming
+        # when stream parameter is not explicitly set (e.g. freebuff proxy).
+        api_kwargs = dict(api_kwargs)
+        api_kwargs["stream"] = False
         return agent.client.chat.completions.create(**api_kwargs)
     request_client = make_client("chat_completion_request")
+    # Ensure non-streaming request to avoid providers that default to streaming
+    # when stream parameter is not explicitly set (e.g. freebuff proxy).
+    api_kwargs = dict(api_kwargs)
+    api_kwargs["stream"] = False
     return create_chat_completion_with_lmstudio_gate(
         request_client,
         api_kwargs,

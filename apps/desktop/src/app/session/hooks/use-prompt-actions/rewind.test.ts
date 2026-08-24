@@ -475,7 +475,7 @@ describe('runRewindSubmit durable-address discipline (#87059)', () => {
     expect(submit?.params?.confirm_truncate).toBeUndefined()
   })
 
-  it('leaves a bound durable rowId untouched (no extra history call)', async () => {
+  it('leaves a bound durable rowId untouched (no extra history call) and drops the client ordinal', async () => {
     const calls: Call[] = []
 
     await runRewindSubmit(makeGateway(calls), 'sid', 'fixed prompt', 1, undefined, false, undefined, 13, 'typo prompt')
@@ -485,7 +485,27 @@ describe('runRewindSubmit durable-address discipline (#87059)', () => {
     const submit = calls.find(call => call.method === 'prompt.submit')
 
     expect(submit?.params?.truncate_before_row_id).toBe(13)
-    expect(submit?.params?.truncate_before_user_ordinal).toBe(1)
+    // The row id is the authoritative cut target; a lineage-space ordinal that
+    // diverges from the gateway's tip-relative target would trip the gateway's
+    // 4030 cross-check even though the address itself is right (#87059).
+    expect(submit?.params?.truncate_before_user_ordinal).toBeUndefined()
+    expect(submit?.params?.confirm_truncate).toBe(true)
+  })
+
+  it('drops a divergent ordinal so a bound rowId can cut without the 4030 mismatch (#87059)', async () => {
+    const calls: Call[] = []
+
+    // The client counted 8 visible user turns (full lineage) while the row id
+    // resolves tip-relative — the exact shape that produced
+    // "truncate_before_user_ordinal (8) does not match truncate_before_row_id
+    // target turn (4)" on edit. The address alone must be sent.
+    await runRewindSubmit(makeGateway(calls), 'sid', 'edited prompt', 8, undefined, false, undefined, 13, 'old prompt')
+
+    const submit = calls.find(call => call.method === 'prompt.submit')
+
+    expect(submit?.params?.truncate_before_row_id).toBe(13)
+    expect(submit?.params?.truncate_before_user_ordinal).toBeUndefined()
+    expect(submit?.params?.confirm_truncate).toBe(true)
   })
 })
 
