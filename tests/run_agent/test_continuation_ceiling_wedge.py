@@ -231,6 +231,97 @@ class TestContinuationCeilingWedge:
         assert "and the rest." in result2["final_response"]
 
 
+class TestEmptyOutputWedge:
+    """Tests for the reasoning-exhaustion wedge: finish_reason=length with
+    zero visible content and no tool calls. The loop must detect this as
+    distinct from a real partial truncation and route through force-overflow
+    compression + the wrap-up nudge instead of "continue where you left off".
+    """
+
+    def _empty_length_stub(self):
+        """A response with finish_reason=length and empty content."""
+        from tests.run_agent.test_run_agent import _mock_assistant_msg
+        return SimpleNamespace(
+            id="resp_empty_001",
+            model="test/model",
+            choices=[SimpleNamespace(
+                index=0,
+                message=_mock_assistant_msg(content=""),
+                finish_reason=FINISH_REASON_LENGTH,
+            )],
+            usage=SimpleNamespace(
+                prompt_tokens=50000,
+                completion_tokens=8000,
+                total_tokens=58000,
+            ),
+        )
+
+    def test_empty_output_uses_wedge_nudge(self, loop_agent):
+        """When finish_reason=length produces empty content, the nudge must
+        be the wrap-up prompt, not 'continue where you left off'."""
+        from tests.run_agent.test_run_agent import _mock_response
+        loop_agent.client.chat.completions.create.side_effect = [
+            self._empty_length_stub(),
+            _mock_response(content="Here is a todo update.", finish_reason="stop"),
+        ]
+        with patch.object(loop_agent, "_persist_session"), \
+             patch.object(loop_agent, "_save_trajectory"), \
+             patch.object(loop_agent, "_cleanup_task_resources"):
+            result = loop_agent.run_conversation("do the task")
+
+        # The nudge must contain the wedge-specific wording
+        nudges = [
+            m for m in result["messages"]
+            if m.get("role") == "user"
+            and "output budget was consumed by reasoning" in (m.get("content") or "")
+        ]
+        assert len(nudges) >= 1, (
+            "Empty-output wedge must emit the wrap-up nudge, not the generic "
+            "'continue where you left off' prompt."
+        )
+
+    def test_partial_output_not_treated_as_wedge(self, loop_agent):
+        """A real partial truncation (non-empty content) must NOT get the
+        wedge nudge — it should get the standard continuation prompt."""
+        from tests.run_agent.test_run_agent import _mock_response
+        loop_agent.client.chat.completions.create.side_effect = [
+            _stub("partial answer that got cut off "),
+            _mock_response(content="the rest.", finish_reason="stop"),
+        ]
+        with patch.object(loop_agent, "_persist_session"), \
+             patch.object(loop_agent, "_save_trajectory"), \
+             patch.object(loop_agent, "_cleanup_task_resources"):
+            result = loop_agent.run_conversation("write a long report")
+
+        wedge_nudges = [
+            m for m in result["messages"]
+            if m.get("role") == "user"
+            and "output budget was consumed by reasoning" in (m.get("content") or "")
+        ]
+        assert wedge_nudges == [], (
+            "Non-empty partial must not trigger the wedge nudge."
+        )
+        standard_nudges = [
+            m for m in result["messages"]
+            if m.get("role") == "user"
+            and "Continue exactly where you left off" in (m.get("content") or "")
+        ]
+        assert len(standard_nudges) >= 1, (
+            "Non-empty partial must get the standard continuation nudge."
+        )
+
+    def test_wedge_nudge_recognized_as_synthetic(self):
+        """The context_compressor must recognize the wedge nudge as a
+        synthetic compression user turn (not a real human message)."""
+        from agent.context_compressor import ContextCompressor
+        from agent.conversation_loop import _LENGTH_CONTINUATION_EMPTY_OUTPUT
+        msg = {"role": "user", "content": _LENGTH_CONTINUATION_EMPTY_OUTPUT}
+        assert ContextCompressor._is_synthetic_compression_user_turn(msg), (
+            "The wedge nudge must be recognized as synthetic so LCM doesn't "
+            "treat it as a real human turn."
+        )
+
+
 class TestTruncatedPartJoining:
     """#78577 — parts joined with no separator glued text together."""
 
