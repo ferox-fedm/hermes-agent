@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import inspect
 import threading
+from pathlib import Path
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -62,6 +63,22 @@ def _note_tick_failure(exc: BaseException, consecutive_failures: int) -> int:
         _reclaim_fds_best_effort()
         return consecutive_failures + 1
     return 0
+
+
+def _is_real_profile_home(home) -> bool:
+    """True when *home* is a real, existing profile home worth ticking.
+
+    A named profile home (one directly under a ``profiles/`` root) must exist
+    on disk AND carry the ``SOUL.md`` marker that `hermes profile create` and
+    ``ensure_hermes_home`` always seed. A directory that fails this check is a
+    deleted/phantom profile — often a shell re-created by an older stale tick —
+    and must never be serviced (doing so would re-materialize it and repopulate
+    the Desktop profile selector). The default root home is always valid.
+    """
+    p = Path(home)
+    if p.parent.name != "profiles":
+        return True
+    return p.is_dir() and (p / "SOUL.md").is_file()
 
 
 class CronScheduler(ABC):
@@ -638,6 +655,12 @@ class InProcessCronScheduler(CronScheduler):
         agent execution to that profile's home — mirroring how
         ``_profile_runtime_scope`` scopes the multiplexed inbound path and
         ``web_server.py`` scopes per-profile cron API calls.
+
+        ``profile_homes`` is captured once at startup and would otherwise be
+        ticked forever. We re-filter it to *existing real profiles* on every
+        pass so a profile deleted mid-session stops being timestamped (and
+        thus never resurrects its directory). ``ensure_dirs()`` guards the
+        mkdir side as a second line of defense.
         """
         import logging
         from cron.scheduler import tick as cron_tick
@@ -656,8 +679,11 @@ class InProcessCronScheduler(CronScheduler):
             [p[0] if isinstance(p, tuple) else p for p in profile_homes],
         )
 
-        # Recovery + initial heartbeat for every profile.
-        for entry in profile_homes:
+        # Recovery + initial heartbeat for every profile. Skip homes that are
+        # no longer real profiles (deleted mid-session) so they are not
+        # re-materialized by the heartbeat's ensure_dirs side effect.
+        for entry in (e for e in profile_homes
+                      if _is_real_profile_home(e[1] if isinstance(e, tuple) else e)):
             home = entry[1] if isinstance(entry, tuple) else entry
             home_token = set_hermes_home_override(str(home))
             try:
@@ -681,7 +707,8 @@ class InProcessCronScheduler(CronScheduler):
                 if can_dispatch is not None and not can_dispatch():
                     logger.debug("Cron dispatch paused while gateway drains existing work")
                 else:
-                    for entry in profile_homes:
+                    for entry in (e for e in profile_homes
+                                  if _is_real_profile_home(e[1] if isinstance(e, tuple) else e)):
                         home = entry[1] if isinstance(entry, tuple) else entry
                         home_token = set_hermes_home_override(str(home))
                         try:
@@ -704,7 +731,8 @@ class InProcessCronScheduler(CronScheduler):
             else:
                 _tick_error = None
             # Record per-profile heartbeat after each tick cycle.
-            for entry in profile_homes:
+            for entry in (e for e in profile_homes
+                          if _is_real_profile_home(e[1] if isinstance(e, tuple) else e)):
                 home = entry[1] if isinstance(entry, tuple) else entry
                 home_token = set_hermes_home_override(str(home))
                 try:

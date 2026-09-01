@@ -696,8 +696,26 @@ def _preserve_file_ownership(path: Path, before: Optional[os.stat_result]) -> No
 
 
 def ensure_dirs():
-    """Ensure cron directories exist with secure permissions."""
+    """Ensure cron directories exist with secure permissions.
+
+    For named profiles (homes under a ``profiles/`` root) the home directory
+    must already exist as a real profile before we materialize ``cron/`` under
+    it. The multiplex cron ticker captures its profile-home list once at
+    startup and ticks it forever; without this guard, a profile deleted
+    mid-session would have its directory skeleton (and ``cron/``) re-created
+    by ``mkdir(parents=True)`` on the very next tick, resurrecting it in the
+    Desktop profile selector (#ghost-profiles). The default home is always
+    legitimate and keeps the legacy create-on-first-launch behavior.
+    """
     store = _current_cron_store()
+    home = store.cron_dir.parent
+    if home.parent.name == "profiles":
+        # Named-profile home: refuse to resurrect a deleted / phantom profile.
+        # A real profile is seeded with SOUL.md by both `hermes profile create`
+        # and `ensure_hermes_home`, so its absence marks a shell dir (e.g. one
+        # re-created by an earlier stale tick) that must not be serviced.
+        if not home.is_dir() or not (home / "SOUL.md").is_file():
+            return
     store.cron_dir.mkdir(parents=True, exist_ok=True)
     store.output_dir.mkdir(parents=True, exist_ok=True)
     _secure_dir(store.cron_dir)

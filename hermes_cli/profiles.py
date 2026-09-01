@@ -1022,6 +1022,14 @@ def list_profiles() -> List[ProfileInfo]:
                 continue  # already added as the built-in default above
             if not _PROFILE_ID_RE.match(name):
                 continue
+            # Only surface *real* profiles. A named profile is seeded with
+            # SOUL.md by `hermes profile create` and by ensure_hermes_home, so
+            # a directory without it is a shell (a backup, manual mkdir, or a
+            # stub resurrected by a stale process after the profile was
+            # deleted) and must not appear in profile selectors. Mirrors the
+            # "real profile marker" guard in container_boot.py.
+            if not (entry / "SOUL.md").is_file():
+                continue
             model, provider = _read_config_model(entry)
             alias_name = alias_map.get(normalize_profile_name(name))
             if alias_name:

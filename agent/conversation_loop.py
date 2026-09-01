@@ -1178,13 +1178,32 @@ _LENGTH_CONTINUATION_OUTPUT_LIMIT = (
     "length limit. Continue exactly where you left off. Do not "
     "restart or repeat prior text. Finish the answer directly.]"
 )
+# Variant for the empty-content-at-length wedge (reasoning exhaustion):
+# the model burned the entire output budget on hidden reasoning and produced
+# zero visible content. "Continue where you left off" is incoherent — there is
+# nothing to continue. Instead, prompt for the smallest executable step so the
+# tool loop fires (and its pre-API compression gate re-runs) or the turn ends
+# cleanly for a fresh retry. Used only when finish_reason=length AND content is
+# empty AND no tool calls were emitted (the _is_empty_partial_stub path).
+_LENGTH_CONTINUATION_EMPTY_OUTPUT = (
+    "[System: Your previous response was cut off before producing any "
+    "output — the output budget was consumed by reasoning. Do not "
+    "restart full reasoning. Based on the tool results already available, "
+    "produce the smallest executable step or a one-line conclusion for "
+    "the current task (for example, one small tool call such as updating "
+    "your todo list, or a short progress summary), then continue your "
+    "work.]"
+)
 # The dropped-tools variant interpolates the tool name list right after this
 # prefix, so it can't be exact-matched — this stable prefix is what
 # _is_synthetic_compression_user_turn checks with str.startswith instead.
 _LENGTH_CONTINUATION_DROPPED_TOOLS_PREFIX = "[System: Your previous tool call "
 
 
-def _get_continuation_prompt(is_partial_stub: bool, dropped_tools: Optional[List[str]] = None) -> str:
+def _get_continuation_prompt(is_partial_stub: bool, dropped_tools: Optional[List[str]] = None,
+                             empty_output: bool = False) -> str:
+    if empty_output:
+        return _LENGTH_CONTINUATION_EMPTY_OUTPUT
     if is_partial_stub and dropped_tools:
         tool_list = ", ".join(dropped_tools[:3])
         return (
@@ -3933,6 +3952,20 @@ def run_conversation(
                                     response, "_dropped_tool_names", None
                                 )
 
+                                # Detect the reasoning-exhaustion wedge: the model
+                                # produced zero visible content at finish_reason=length
+                                # (all output tokens consumed by hidden reasoning).
+                                # "Continue where you left off" is incoherent here —
+                                # there is nothing to continue. Route through a
+                                # force-overflow compression attempt first (frees output
+                                # headroom by shrinking input), then use the wrap-up
+                                # nudge as fallback if compression is unavailable.
+                                _is_empty_output_wedge = (
+                                    not _is_partial_stream_stub
+                                    and not _dropped_tools
+                                    and not (getattr(assistant_message, "content", None) or "").strip()
+                                )
+
                                 if _is_partial_stream_stub and _dropped_tools:
                                     _tool_list = ", ".join(_dropped_tools[:3])
                                     agent._vprint(
@@ -3947,14 +3980,109 @@ def run_conversation(
                                         f"requesting continuation "
                                         f"({length_continue_retries}/4)..."
                                     )
+                                elif _is_empty_output_wedge:
+                                    agent._vprint(
+                                        f"{agent.log_prefix}↻ Output budget exhausted by "
+                                        f"reasoning (empty content at length) — "
+                                        f"attempting compression + fresh retry "
+                                        f"({length_continue_retries}/4)...",
+                                        force=True,
+                                    )
                                 else:
                                     agent._vprint(
                                         f"{agent.log_prefix}↻ Requesting continuation "
                                         f"({length_continue_retries}/4)..."
                                     )
 
+                                # Empty-output wedge: try force-overflow compression
+                                # to reclaim output headroom before sending any nudge.
+                                # The previous response is complete (no active stream),
+                                # so the LM Studio single-model gate is free and the
+                                # main model can serve the summary call without deadlock.
+                                _compression_reclaimed = False
+                                if (
+                                    _is_empty_output_wedge
+                                    and agent.compression_enabled
+                                    and compression_attempts < max_compression_attempts
+                                    and len(messages) > 1
+                                ):
+                                    _compressor = agent.context_compressor
+                                    _comp_cooldown = getattr(
+                                        _compressor,
+                                        "get_active_compression_failure_cooldown",
+                                        lambda: None,
+                                    )()
+                                    if not _comp_cooldown:
+                                        compression_attempts += 1
+                                        agent._vprint(
+                                            f"{agent.log_prefix}   Force-overflow "
+                                            f"compression (attempt "
+                                            f"{compression_attempts}/"
+                                            f"{max_compression_attempts})...",
+                                        )
+                                        _pre_comp_input = messages
+                                        try:
+                                            messages, active_system_prompt = (
+                                                agent._compress_context(
+                                                    messages,
+                                                    system_message,
+                                                    approx_tokens=getattr(
+                                                        _compressor,
+                                                        "last_prompt_tokens",
+                                                        0,
+                                                    ),
+                                                    task_id=effective_task_id,
+                                                )
+                                            )
+                                        except Exception as _comp_err:
+                                            logger.warning(
+                                                "Force-overflow compression failed: %s",
+                                                _comp_err,
+                                            )
+                                            messages = _pre_comp_input
+                                        if messages is not _pre_comp_input:
+                                            _compression_reclaimed = True
+                                            agent._session_messages = messages
+                                            conversation_history = (
+                                                conversation_history_after_compression(
+                                                    agent, messages,
+                                                    conversation_history,
+                                                )
+                                            )
+                                            # Re-anchor the current-turn user index
+                                            # after compaction rebuilt messages.
+                                            current_turn_user_idx = (
+                                                reanchor_current_turn_user_idx(
+                                                    messages, user_message
+                                                )
+                                            )
+                                            agent._persist_user_message_idx = (
+                                                current_turn_user_idx
+                                            )
+                                            agent._empty_content_retries = 0
+                                            agent._thinking_prefill_retries = 0
+                                            agent._last_content_with_tools = None
+                                            agent._last_content_tools_all_housekeeping = False
+                                            agent._mute_post_response = False
+                                            _retry.restart_with_length_continuation = True
+                                            break
+                                        else:
+                                            # Compression no-op'd (e.g. raw backlog
+                                            # below leaf chunk even in force mode, or
+                                            # lock-skip). Fall through to the nudge.
+                                            compression_attempts -= 1
+                                            logger.info(
+                                                "Force-overflow compression made no "
+                                                "progress; falling back to wrap-up nudge"
+                                            )
+
+                                # Standard continuation nudge (also the fallback
+                                # when force-overflow compression was unavailable,
+                                # failed, or no-op'd).
                                 _continue_content = _get_continuation_prompt(
-                                    _is_partial_stream_stub, _dropped_tools
+                                    _is_partial_stream_stub,
+                                    _dropped_tools,
+                                    empty_output=_is_empty_output_wedge,
                                 )
                                 continue_msg = {
                                     "role": "user",
