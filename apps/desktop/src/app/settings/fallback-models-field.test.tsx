@@ -84,9 +84,7 @@ describe('FallbackModelsField', () => {
     // otherwise a profile-defined provider (e.g. `providers.bai`) is missing.
     await renderField(CHAIN, vi.fn(), 'code_reviewer')
 
-    await waitFor(() =>
-      expect(getGlobalModelOptions).toHaveBeenCalledWith(undefined, 'code_reviewer')
-    )
+    await waitFor(() => expect(getGlobalModelOptions).toHaveBeenCalledWith(undefined, 'code_reviewer'))
   })
 
   it('follows the active profile when no scope override is set', async () => {
