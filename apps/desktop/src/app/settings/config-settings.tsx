@@ -431,6 +431,7 @@ function ConfigSettingsInner({
                 }
                 onChange={value => updateConfig(setNested(config, key, value))}
                 optionLabels={key === 'tts.elevenlabs.voice_id' ? elevenLabsVoiceLabels : undefined}
+                profile={scopeProfile}
                 schema={field}
                 schemaKey={key}
                 value={getNested(config, key)}

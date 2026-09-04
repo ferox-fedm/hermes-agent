@@ -65,9 +65,16 @@ function entriesEqual(a: FallbackEntry[], b: FallbackEntry[]): boolean {
  * autosave never persists a partial `{provider, model: ''}`.
  */
 export function FallbackModelsField({
+  profile,
   value,
   onChange
 }: {
+  /** Settings "Applies to" scope. `undefined` → follow the app's active
+   *  profile (the ambient `_apiProfile` in api/client.ts). Must be threaded
+   *  through or the provider dropdown lists the ACTIVE profile's providers
+   *  while the rows edit a different profile's `fallback_providers` — a
+   *  profile-defined provider (e.g. `providers.bai`) then never appears. */
+  profile?: string
   value: unknown
   onChange: (next: FallbackEntry[]) => void
 }) {
@@ -75,8 +82,12 @@ export function FallbackModelsField({
   const m = t.settings.model
 
   const modelOptions = useQuery({
-    queryKey: ['model-options', 'global'],
-    queryFn: () => getGlobalModelOptions()
+    // Keyed by scope: the "Applies to" chip swaps `profile` without remounting
+    // this component, so a shared key would serve one profile's catalog under
+    // another's rows. 'ambient' marks the follow-the-active-profile path
+    // (invalidated app-wide by invalidateProfileScopedQueries on switch).
+    queryKey: ['model-options', profile ?? 'ambient', 'fallback-settings'],
+    queryFn: () => getGlobalModelOptions(undefined, profile)
   })
 
   const providers = (modelOptions.data?.providers ?? []).filter(provider => provider.slug)

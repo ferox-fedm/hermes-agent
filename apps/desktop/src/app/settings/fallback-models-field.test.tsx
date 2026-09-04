@@ -12,7 +12,7 @@ beforeAll(() => {
 const getGlobalModelOptions = vi.fn()
 
 vi.mock('@/hermes', () => ({
-  getGlobalModelOptions: () => getGlobalModelOptions()
+  getGlobalModelOptions: (...args: unknown[]) => getGlobalModelOptions(...args)
 }))
 
 beforeEach(() => {
@@ -30,13 +30,13 @@ afterEach(() => {
   vi.clearAllMocks()
 })
 
-async function renderField(value: unknown, onChange = vi.fn()) {
+async function renderField(value: unknown, onChange = vi.fn(), profile?: string) {
   const { FallbackModelsField } = await import('./fallback-models-field')
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
 
   render(
     <QueryClientProvider client={client}>
-      <FallbackModelsField onChange={onChange} value={value} />
+      <FallbackModelsField onChange={onChange} profile={profile} value={value} />
     </QueryClientProvider>
   )
 
@@ -76,6 +76,23 @@ describe('FallbackModelsField', () => {
     expect(screen.getByText('Add fallback')).toBeTruthy()
     expect(screen.queryByText(/\[object Object\]/)).toBeNull()
     await waitFor(() => expect(getGlobalModelOptions).toHaveBeenCalled())
+  })
+
+  it('fetches the provider catalog for the settings scope profile', async () => {
+    // The rows edit THIS profile's fallback_providers; the provider dropdown
+    // must be that profile's catalog, not the ambient active profile's —
+    // otherwise a profile-defined provider (e.g. `providers.bai`) is missing.
+    await renderField(CHAIN, vi.fn(), 'code_reviewer')
+
+    await waitFor(() =>
+      expect(getGlobalModelOptions).toHaveBeenCalledWith(undefined, 'code_reviewer')
+    )
+  })
+
+  it('follows the active profile when no scope override is set', async () => {
+    await renderField(CHAIN)
+
+    await waitFor(() => expect(getGlobalModelOptions).toHaveBeenCalledWith(undefined, undefined))
   })
 
   it('removing a row emits the remaining entries', async () => {

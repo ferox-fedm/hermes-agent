@@ -31,7 +31,8 @@ export function ConfigField({
   enumOptions,
   optionLabels,
   onChange,
-  descriptionExtra
+  descriptionExtra,
+  profile
 }: {
   schemaKey: string
   schema: ConfigFieldSchema
@@ -40,6 +41,9 @@ export function ConfigField({
   optionLabels?: Record<string, string>
   onChange: (value: unknown) => void
   descriptionExtra?: ReactNode
+  /** Settings "Applies to" scope for fields that fetch their own options
+   *  (currently `fallback_providers`). `undefined` → follow the active profile. */
+  profile?: string
 }) {
   const { t } = useI18n()
   const c = t.settings.config
@@ -85,7 +89,7 @@ export function ConfigField({
   // `list` branch below would stringify them to "[object Object]". Render the
   // dedicated structured editor instead.
   if (schemaKey === 'fallback_providers') {
-    return row(<FallbackModelsField onChange={onChange} value={value} />, true)
+    return row(<FallbackModelsField onChange={onChange} profile={profile} value={value} />, true)
   }
 
   if (schema.type === 'boolean') {
