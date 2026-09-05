@@ -240,6 +240,17 @@ def create_chat_completion_with_lmstudio_gate(
         raise
 
     if kwargs.get("stream"):
+        # Some adapters ignore ``stream=True`` and return a COMPLETED response
+        # object (has ``.choices``) instead of an iterator. Wrapping it in
+        # ``_LockedStream`` would hide the original object from callers that
+        # adopt completed responses by identity (upstream's relay does exactly
+        # this via ``completed_response_predicate=hasattr(value, 'choices')``),
+        # breaking ``response is final_response`` semantics and re-streaming
+        # bookkeeping. Release the gate and pass the completed response through
+        # raw; only true iterables (actual LM Studio streams) hold the gate.
+        if hasattr(response, "choices"):
+            guard.__exit__(None, None, None)
+            return response
         return _LockedStream(response, guard)
 
     guard.__exit__(None, None, None)
