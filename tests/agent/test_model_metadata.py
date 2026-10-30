@@ -288,6 +288,51 @@ class TestDefaultContextLengths:
                     base_url=base_url,
                 ) == 1_000_000
 
+    def test_nvidia_minimax_m3_1_flash_context_is_endpoint_scoped(self):
+        """NVIDIA's 262K NIM window for minimax-m3.1-flash must not leak to other endpoints.
+
+        The bare ``minimax-m3`` slug resolves to 1M EVERYWHERE via
+        DEFAULT_CONTEXT_LENGTHS - that window is a property of MiniMax's own API,
+        which really does serve 1M. NIM serves the same model at 262,144, so the
+        NIM endpoint needs its own row. NIM's /v1/models catalog carries no
+        ``limit.context`` for this model, and models.dev's 262144 is rejected in
+        favour of the hardcoded 1M, so the endpoint-scoped table is the only place
+        the correct window can live.
+        """
+        with patch("agent.model_metadata.get_cached_context_length", return_value=None), \
+             patch("agent.model_metadata.fetch_model_metadata", return_value={}), \
+             patch("agent.model_metadata.fetch_endpoint_model_metadata", return_value={}), \
+             patch("agent.model_metadata._query_ollama_api_show", return_value=None), \
+             patch("agent.models_dev.lookup_models_dev_context", return_value=None):
+            accepted_urls = (
+                "https://integrate.api.nvidia.com/v1",
+                "https://INTEGRATE.API.NVIDIA.COM/v1/",
+                "https://integrate.api.nvidia.com:443/v1",
+            )
+            rejected_urls = (
+                "http://integrate.api.nvidia.com/v1",
+                "https://integrate.api.nvidia.com:8443/v1",
+                "https://integrate.api.nvidia.com/v1/other",
+                "https://integrate.api.nvidia.com/v1?route=other",
+                "https://example.invalid/v1",
+                "https://api.minimax.io/v1",
+                "https://openrouter.ai/api/v1",
+            )
+
+            for base_url in accepted_urls:
+                assert get_model_context_length(
+                    "minimaxai/minimax-m3.1-flash",
+                    provider="nvidia",
+                    base_url=base_url,
+                ) == 262_144
+
+            for base_url in rejected_urls:
+                assert get_model_context_length(
+                    "minimaxai/minimax-m3.1-flash",
+                    provider="nvidia",
+                    base_url=base_url,
+                ) == 1_000_000
+
     def test_k3_context_is_scoped_to_confirmed_coding_endpoint(self):
         """The bare ``k3`` slug's 1 Mi context must not leak to unverified endpoints.
 

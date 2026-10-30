@@ -594,6 +594,7 @@ def _ollama_show_context(data: dict[str, Any], *, gguf_first: bool, minimum: Opt
 _ENDPOINT_SCOPED_CONTEXT = (
     ("api.kimi.com", {"/coding", "/coding/v1"}, {"k3", "kimi-k3", "kimi-k3-cot"}, 1_048_576),
     ("integrate.api.nvidia.com", {"/v1"}, {"deepseek-ai/deepseek-v4-pro"}, 262_144),
+    ("integrate.api.nvidia.com", {"/v1"}, {"minimaxai/minimax-m3.1-flash"}, 262_144),
 )
 
 
